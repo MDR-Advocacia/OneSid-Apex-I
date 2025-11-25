@@ -2,10 +2,12 @@ import time
 import os
 import re
 import logging
-import json # Novo import
-# Adiciona o diretório atual ao path para garantir que importe o módulo local
+import json
 import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Adiciona o diretório raiz ao path para importar 'bd' corretamente
+# Estamos em RPA/main.py, queremos acessar ../bd
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -13,333 +15,244 @@ from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv
 
+# Importa o módulo de banco que acabamos de criar
+from bd import database
+
 # Configuração de Logs
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# Carrega as variáveis do arquivo .env
 load_dotenv()
 
 def limpar_apenas_digitos(texto):
-    """
-    Remove tudo que não for dígito.
-    Ex: 2022/0204732-000 -> 20220204732000
-    """
-    if not texto:
-        return ""
+    if not texto: return ""
     return re.sub(r'\D', '', str(texto))
 
-def acessar_processo_consulta_rapida(driver, numero_processo):
-    """
-    Navega para a URL inicial de consulta rápida usando o número do processo (CNJ).
-    """
-    numero_limpo = limpar_apenas_digitos(numero_processo)
-    if not numero_limpo:
-        logging.warning("Número de processo vazio ou inválido.")
+def esperar_carregamento_completo(driver, timeout=30):
+    logging.info("⏳ Aguardando página estabilizar...")
+    try:
+        wait = WebDriverWait(driver, timeout)
+        wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+        time.sleep(3)
+        logging.info("✅ Página carregada e estável.")
+        return True
+    except Exception as e:
+        logging.warning(f"⚠️ Alerta de timeout: {e}")
         return False
 
-    url_base = "https://juridico.bb.com.br/paj/juridico/v2?app=processoConsultaRapidoTomboApp&numeroTombo="
-    url_final = f"{url_base}{numero_limpo}"
-    
-    logging.info(f"🚀 [ETAPA 1] Navegando para consulta rápida: {numero_limpo}")
-    driver.get(url_final)
-    
-    # ESTRATÉGIA MUDADA: Espera fixa de 10 segundos para garantir carregamento total
-    logging.info("⏳ Aguardando 10 segundos fixos para carregamento da página...")
-    time.sleep(10)
-    return True
-
 def buscar_elemento_em_todos_contextos(driver, by, value):
-    """
-    Função Poderosa: Procura um elemento no contexto principal E dentro de qualquer iframe.
-    IMPORTANTE: Se encontrar dentro de um iframe, MANTÉM o driver dentro desse iframe
-    para permitir interação.
-    """
-    # 1. Tenta no contexto principal
+    # (Mesma função robusta de antes)
     try:
         driver.switch_to.default_content()
-        elemento = driver.find_element(by, value)
-        logging.info("✅ Elemento encontrado no contexto principal!")
-        return elemento
+        return driver.find_element(by, value)
     except:
         pass
-
-    # 2. Lista e varre iframes
-    # Precisamos estar no default_content para listar os iframes
+    
     driver.switch_to.default_content()
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
-    
-    if not iframes:
-        return None
-    
-    for i, iframe in enumerate(iframes):
+    for iframe in iframes:
         try:
-            # Garante que volta para a raiz antes de entrar no próximo iframe da lista
             driver.switch_to.default_content()
             driver.switch_to.frame(iframe)
-            
-            elemento = driver.find_element(by, value)
-            logging.info(f"✅ Elemento encontrado dentro do iframe índice {i}!")
-            # CORREÇÃO: Não voltamos para default_content aqui.
-            # Retornamos com o foco DENTRO do iframe para podermos ler o texto.
-            return elemento
+            return driver.find_element(by, value)
         except:
-            continue 
-
-    # Se varreu tudo e não achou, volta para segurança
+            continue
     driver.switch_to.default_content()
     return None
 
+def acessar_processo_consulta_rapida(driver, numero_processo):
+    numero_limpo = limpar_apenas_digitos(numero_processo)
+    if not numero_limpo: return False
+
+    url = f"https://juridico.bb.com.br/paj/juridico/v2?app=processoConsultaRapidoTomboApp&numeroTombo={numero_limpo}"
+    logging.info(f"🚀 [ETAPA 1] Navegando para consulta: {numero_limpo}")
+    driver.get(url)
+    
+    logging.info("⏳ Aguardando 10s fixos...")
+    time.sleep(10)
+    return True
+
 def extrair_e_acessar_npj(driver):
     """
-    Localiza o NPJ usando a estrutura exata do Angular (ng-repeat) fornecida.
+    Localiza o NPJ, valida o padrão e navega para edição.
+    Retorna o (npj_limpo) string se sucesso, ou None se falha/inválido.
     """
-    logging.info("🔍 Procurando NPJ na tabela (Scan Angular)...")
-    
+    logging.info("🔍 Procurando NPJ...")
     elemento_npj = None
-    max_tentativas = 5 
     
-    # Estratégia de Seletores (do mais específico para o mais genérico)
-    seletores_xpath = [
-        # 1. Cirúrgico: Pega a primeira coluna da linha gerada pelo ng-repeat
+    seletores = [
         "//tr[contains(@ng-repeat, 'resultadoProcessos.processos')]//td[1]//span[contains(@class, 'ng-binding')]",
-        
-        # 2. Baseado no estilo da coluna (width: 15%)
         "//td[contains(@style, 'width: 15%')]//span[contains(@class, 'ng-binding')]",
-        
-        # 3. Genérico (Padrão de texto com / e -)
         "//*[text()[contains(.,'/') and contains(.,'-')]]"
     ]
 
-    for tentativa in range(1, max_tentativas + 1):
-        try:
-            # Tenta cada seletor da lista
-            for xpath in seletores_xpath:
-                elemento_npj = buscar_elemento_em_todos_contextos(driver, By.XPATH, xpath)
-                if elemento_npj:
-                    logging.info(f"🎯 Alvo localizado usando XPath: {xpath}")
-                    break
-            
-            if elemento_npj:
-                break
-            
-            logging.warning(f"⚠️ Tentativa {tentativa}/{max_tentativas}: Tabela Angular ainda vazia ou carregando...")
-            time.sleep(5) # Espera fixa entre tentativas
-            
-        except Exception as e:
-            logging.error(f"Erro na tentativa {tentativa}: {e}")
-            time.sleep(5)
+    for tentativa in range(1, 4):
+        for xpath in seletores:
+            elemento_npj = buscar_elemento_em_todos_contextos(driver, By.XPATH, xpath)
+            if elemento_npj: break
+        if elemento_npj: break
+        time.sleep(5)
 
     if not elemento_npj:
-        logging.error("❌ Esgotado! O Angular não renderizou a tabela a tempo.")
-        driver.save_screenshot("erro_tabela_vazia.png")
-        return False
+        logging.error("❌ ERRO CRÍTICO: Elemento do NPJ não encontrado na tela. Parando.")
+        return None
 
     try:
-        # AQUI OCORRIA O ERRO: Agora vai funcionar porque o driver está focado no iframe correto
         texto_npj = elemento_npj.text.strip()
-        logging.info(f"✅ Texto Bruto Extraído: {texto_npj}")
+        logging.info(f"✅ Texto Bruto Encontrado: {texto_npj}")
         
-        # Importante: Voltar para o contexto principal para a próxima navegação
         driver.switch_to.default_content()
         
-        # Limpeza e Validação
-        # MUDANÇA: O NPJ precisa ter os 3 últimos '000' removidos
-        numeros_brutos = limpar_apenas_digitos(texto_npj)
-        
-        if numeros_brutos.endswith('000'):
-            npj_limpo = numeros_brutos[:-3]
-        else:
-            npj_limpo = numeros_brutos
+        # --- VALIDAÇÃO DE PADRÃO (REGEX) ---
+        # Padrão esperado: 4 dígitos (ano) / N dígitos - N dígitos
+        # Ex: 2022/0204732-000
+        padrao_npj = r"\d{4}/\d+-\d+"
+        if not re.search(padrao_npj, texto_npj):
+            logging.error(f"❌ ERRO CRÍTICO: O texto encontrado '{texto_npj}' NÃO parece um NPJ válido. Abortando para evitar erros.")
+            return None
 
-        logging.info(f"🧹 NPJ Limpo (sem 000 final): {npj_limpo}")
+        numeros = limpar_apenas_digitos(texto_npj)
+        npj_final = numeros[:-3] if numeros.endswith('000') else numeros
         
-        if not npj_limpo:
-             logging.error("❌ Falha: O texto extraído não contém números válidos.")
-             return False
+        if not npj_final or len(npj_final) < 5: # Validação extra de tamanho mínimo
+             logging.error(f"❌ ERRO: NPJ limpo '{npj_final}' parece inválido ou muito curto.")
+             return None
 
-        # Monta a nova URL conforme solicitado
-        # Link: .../processo-consulta.app.html#/editar/NPJ/0/18
-        nova_url = f"https://juridico.bb.com.br/paj/app/paj-cadastro/spas/processo/consulta/processo-consulta.app.html#/editar/{npj_limpo}/0/18"
+        logging.info(f"🧹 NPJ Validado e Limpo: {npj_final}")
+
+        nova_url = f"https://juridico.bb.com.br/paj/app/paj-cadastro/spas/processo/consulta/processo-consulta.app.html#/editar/{npj_final}/0/18"
         
-        logging.info(f"🚀 [ETAPA 2] Acessando link de edição do NPJ...")
-        logging.info(f"--> URL: {nova_url}")
-        
+        logging.info(f"🚀 [ETAPA 2] Indo para edição...")
         driver.get(nova_url)
-        
-        logging.info("⏳ Aguardando 10 segundos fixos para carregamento da edição...")
         time.sleep(10)
         
-        return True
+        return npj_final
 
     except Exception as e:
         logging.error(f"❌ Erro ao processar NPJ: {e}")
-        return False
+        return None
 
-def extrair_dados_subsidios_paginado(driver):
+def coletar_lista_subsidios(driver):
     """
-    Coleta Tipo, Item e Estado da tabela de subsídios, clicando em 'Próximo'
-    se houver paginação. Gera um JSON no final.
+    Navega pelas páginas e retorna uma LISTA de dicionários.
+    Não salva JSON nem BD aqui, apenas coleta.
     """
-    logging.info("📊 Iniciando extração de subsídios (com paginação)...")
+    logging.info("📊 Iniciando coleta de subsídios...")
+    lista_final = []
+    pagina = 1
     
-    dados_coletados = []
-    pagina_atual = 1
-    
-    # 1. Tenta localizar a tabela para garantir o foco no iframe/contexto correto
-    # XPath de uma linha da tabela
     xpath_linha = "//tr[contains(@ng-repeat, 'subsidio in vm.resultado.lista')]"
     
-    # Usa nossa função auxiliar para focar no iframe se necessário
-    elemento_teste = buscar_elemento_em_todos_contextos(driver, By.XPATH, xpath_linha)
-    
-    if not elemento_teste:
-        logging.warning("⚠️ Nenhuma tabela de subsídios encontrada.")
-        return False
-        
-    # Loop de Paginação
+    # Foca no iframe certo antes de começar
+    if not buscar_elemento_em_todos_contextos(driver, By.XPATH, xpath_linha):
+        logging.warning("⚠️ Tabela não encontrada.")
+        return []
+
     while True:
-        logging.info(f"📄 Processando Página {pagina_atual}...")
-        
+        logging.info(f"📄 Lendo Página {pagina}...")
         try:
-            # Pega todas as linhas visíveis na página atual
-            # IMPORTANTE: O driver já está no contexto correto (iframe) graças ao 'buscar_elemento_em_todos_contextos' chamado acima
             linhas = driver.find_elements(By.XPATH, xpath_linha)
-            logging.info(f"   -> Encontradas {len(linhas)} linhas nesta página.")
-            
             for linha in linhas:
                 try:
-                    # Extração baseada nos índices das colunas (1-based no XPath)
-                    # Coluna 4: Tipo
-                    # Coluna 5: Item
-                    # Coluna 6: Estado
                     tipo = linha.find_element(By.XPATH, "./td[4]").text.strip()
                     item = linha.find_element(By.XPATH, "./td[5]").text.strip()
                     estado = linha.find_element(By.XPATH, "./td[6]").text.strip()
-                    
-                    dados_coletados.append({
-                        "tipo": tipo,
-                        "item": item,
-                        "estado": estado
-                    })
-                except Exception as e:
-                    logging.warning(f"   ⚠️ Erro ao ler linha individual: {e}")
-
-            # Lógica do Botão Próximo
-            # Procura o botão pelo ng-click
-            xpath_proximo = "//a[contains(@ng-click, 'vm.rechamarPesquisaProximo()')]"
+                    lista_final.append({"tipo": tipo, "item": item, "estado": estado})
+                except: pass
             
-            # Tenta encontrar o botão
+            # Tenta ir para próxima página
+            xpath_prox = "//a[contains(@ng-click, 'vm.rechamarPesquisaProximo()')]"
             try:
-                btn_proximo = driver.find_element(By.XPATH, xpath_proximo)
-                
-                # Verifica se está desabilitado (atributo 'disabled' ou classe 'disabled')
-                is_disabled = btn_proximo.get_attribute("disabled")
-                classes = btn_proximo.get_attribute("class")
-                
-                if is_disabled or (classes and "disabled" in classes) or not btn_proximo.is_enabled():
-                    logging.info("⏹️ Botão 'Próximo' desabilitado. Fim da extração.")
+                btn = driver.find_element(By.XPATH, xpath_prox)
+                if "disabled" in btn.get_attribute("class") or btn.get_attribute("disabled"):
+                    logging.info("⏹️ Fim da paginação.")
                     break
                 
-                # Se não está desabilitado, clica
-                logging.info("➡️ Clicando em 'Próximo'...")
-                # Scroll para garantir visibilidade
-                driver.execute_script("arguments[0].scrollIntoView(true);", btn_proximo)
+                driver.execute_script("arguments[0].scrollIntoView(true);", btn)
                 time.sleep(1)
-                btn_proximo.click()
-                
-                logging.info("⏳ Aguardando 5s para carregar próxima página...")
+                btn.click()
                 time.sleep(5)
-                pagina_atual += 1
-                
-            except Exception:
-                logging.info("⏹️ Botão 'Próximo' não encontrado. Assumindo fim da lista.")
+                pagina += 1
+            except:
                 break
-                
         except Exception as e:
-            logging.error(f"❌ Erro crítico na paginação: {e}")
+            logging.error(f"Erro paginação: {e}")
             break
-
-    # Salvar JSON
-    arquivo_json = "subsidios.json"
-    try:
-        with open(arquivo_json, "w", encoding="utf-8") as f:
-            json.dump(dados_coletados, f, indent=4, ensure_ascii=False)
-        logging.info(f"✅ SUCESSO! {len(dados_coletados)} registros salvos em '{arquivo_json}'.")
-        # Print do JSON no log para conferência
-        print(json.dumps(dados_coletados, indent=4, ensure_ascii=False))
-    except Exception as e:
-        logging.error(f"❌ Erro ao salvar JSON: {e}")
-
-    # Volta para o contexto padrão por segurança
+            
     driver.switch_to.default_content()
-    return True
+    return lista_final
 
 def executar_rpa():
-    logging.info(">>> INICIANDO ROBÔ ONE-SID (FORCE WAIT MODE) <<<")
+    # --- INTERAÇÃO COM O USUÁRIO ---
+    print("\n" + "="*50)
+    processo_input = input("👉 Digite o número do processo (CNJ) ou pressione ENTER para usar o padrão: ").strip()
+    print("="*50 + "\n")
+
+    processo_cnj = processo_input if processo_input else "7005938-33.2022.8.22.0021"
+
+    logging.info(f">>> INICIANDO ROBÔ ONE-SID PARA O PROCESSO: {processo_cnj} <<<")
+    
+    # 1. Inicializa Banco
+    database.inicializar_banco()
     
     usuario_env = os.getenv("BB_USUARIO")
     senha_env = os.getenv("BB_SENHA")
-
-    if not usuario_env or not senha_env:
-        logging.critical("Credenciais não encontradas no .env")
+    if not usuario_env or not senha_env: 
+        logging.error("Credenciais não configuradas no .env")
         return
 
     options = uc.ChromeOptions()
     options.add_argument("--start-maximized")
-    
-    try:
-        logging.info("Iniciando driver...")
-        driver = uc.Chrome(options=options, use_subprocess=True, version_main=142)
-    except Exception as e:
-        logging.critical(f"Erro ao abrir Chrome: {e}")
-        return
+    driver = uc.Chrome(options=options, use_subprocess=True, version_main=142)
 
     try:
-        # --- 1. LOGIN ---
-        logging.info("🔐 Acessando login...")
+        # --- LOGIN ---
+        logging.info("🔐 Logando...")
         driver.get('https://loginweb.bb.com.br/sso/XUI/?realm=/paj&goto=https://juridico.bb.com.br/wfj#login')
+        wait = WebDriverWait(driver, 60)
         
-        wait = WebDriverWait(driver, 20)
-        wait_long = WebDriverWait(driver, 60)
-
-        logging.info("Inserindo usuário...")
         wait.until(EC.visibility_of_element_located((By.ID, "idToken1"))).send_keys(usuario_env)
         time.sleep(0.5)
-        wait.until(EC.element_to_be_clickable((By.ID, "loginButton_0"))).click()
+        driver.find_element(By.ID, "loginButton_0").click()
         
-        logging.info("Inserindo senha...")
-        wait_long.until(EC.visibility_of_element_located((By.ID, "idToken3"))).send_keys(senha_env)
+        wait.until(EC.visibility_of_element_located((By.ID, "idToken3"))).send_keys(senha_env)
         time.sleep(0.5)
-
-        logging.info("Confirmando login...")
+        
         wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#loginButton_0[name='callback_4']"))).click()
+        logging.info("Login OK.")
         
-        # MUDANÇA PEDIDA: Removida a espera de 15s aqui
-        logging.info("Login enviado.")
-        
-        # --- 2. FLUXO ---
-        processo_alvo = "70018740220258220012"
-        
-        # Passo 1: Acessa Consulta Rápida
-        if acessar_processo_consulta_rapida(driver, processo_alvo):
-            # Passo 2: Acha o NPJ e vai para a edição
-            if extrair_e_acessar_npj(driver):
-                # Passo 3: Coleta os dados paginados e salva JSON
-                extrair_dados_subsidios_paginado(driver)
+        # --- FLUXO ---
+        if acessar_processo_consulta_rapida(driver, processo_cnj):
+            
+            # Pega o NPJ da tela e vai para edição
+            npj_encontrado = extrair_e_acessar_npj(driver)
+            
+            if npj_encontrado:
+                # 1. Salva/Atualiza o PROCESSO no Banco
+                logging.info(f"💾 Salvando processo no BD: CNJ={processo_cnj}, NPJ={npj_encontrado}")
+                id_processo_bd = database.salvar_processo(processo_cnj, npj_encontrado)
+                
+                if id_processo_bd:
+                    # 2. Coleta os Subsídios
+                    lista_dados = coletar_lista_subsidios(driver)
+                    
+                    # 3. Salva os Subsídios no Banco
+                    if lista_dados:
+                        logging.info("🔄 Atualizando subsídios no banco (substituindo antigos pelos atuais)...")
+                        database.salvar_lista_subsidios(id_processo_bd, lista_dados)
+                    else:
+                        logging.warning("Nenhum subsídio coletado para salvar.")
+                else:
+                    logging.error("Falha ao criar processo no banco. Subsídios não serão salvos.")
+            else:
+                 logging.error("🚫 FLUXO INTERROMPIDO: Não foi possível obter um NPJ válido.")
 
-        logging.info("🏁 Fluxo finalizado. Manterei aberto por 1 minuto.")
+        logging.info("🏁 Fim. Mantendo 60s.")
         time.sleep(60)
 
-    except Exception as e:
-        logging.error(f"Falha geral: {e}")
-        driver.save_screenshot("erro_geral.png")
-    
     finally:
         driver.quit()
 

@@ -5,6 +5,6 @@ openpyxl
 python-dotenv
 schedule
 requests
-# playwright  <-- Remover ou comentar
 selenium
 undetected-chromedriver
+psycopg2-binary
