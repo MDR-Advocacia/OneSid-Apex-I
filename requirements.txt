@@ -1,0 +1,10 @@
+Flask
+Flask-Cors
+Flask-JWT-Extended
+openpyxl
+python-dotenv
+schedule
+requests
+# playwright  <-- Remover ou comentar
+selenium
+undetected-chromedriver
