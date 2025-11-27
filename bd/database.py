@@ -182,3 +182,37 @@ def salvar_lista_subsidios(processo_id, lista_dados):
         conn.commit()
     except: pass
     finally: cur.close(); conn.close()
+
+def recuperar_subsidios_anteriores(processo_id):
+    """Retorna lista de dicionários com os subsídios atuais do banco para comparação."""
+    conn = get_connection()
+    if not conn: return []
+    lista = []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT tipo, item, estado FROM subsidios WHERE processo_id = %s", (processo_id,))
+        rows = cur.fetchall()
+        for r in rows:
+            lista.append({"tipo": r[0], "item": r[1], "estado": r[2]})
+    except: pass
+    finally: cur.close(); conn.close()
+    return lista
+
+def buscar_solicitante_por_cnj(cnj):
+    """Busca o ID do solicitante na tabela de tarefas original."""
+    conn = get_connection()
+    if not conn: return None
+    solicitante = None
+    try:
+        cur = conn.cursor()
+        # Pega o solicitante da tarefa mais recente para este CNJ
+        cur.execute("""
+            SELECT solicitante_id FROM tarefas_legal_one 
+            WHERE processo_cnj = %s 
+            ORDER BY data_criacao DESC LIMIT 1
+        """, (cnj,))
+        res = cur.fetchone()
+        if res: solicitante = res[0]
+    except: pass
+    finally: cur.close(); conn.close()
+    return solicitante

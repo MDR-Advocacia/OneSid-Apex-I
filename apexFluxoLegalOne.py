@@ -45,7 +45,7 @@ def buscar_e_abastecer_fila():
     
     # 1. Busca Candidatas
     params = {
-        "$filter": "(typeId eq 26 and subTypeId eq 1131) and statusId eq 1 and relationships/any(r: r/linkType eq 'Litigation')",
+        "$filter": "(typeId eq 30 and subTypeId eq 1195) and statusId eq 1 and relationships/any(r: r/linkType eq 'Litigation')",
         "$expand": "relationships($select=id,linkId)",
         "$select": "id,finishedBy,relationships",
         "$top": 30,
