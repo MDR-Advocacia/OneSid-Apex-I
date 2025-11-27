@@ -98,19 +98,29 @@ def verificar_processos_em_monitoramento():
 
                         # Se detectamos alterações relevantes, prepara para envio
                         if itens_alterados:
-                            id_resp = database.buscar_solicitante_por_cnj(cnj)
-                            # Se não achar o ID, usa um padrão ou loga aviso. O JSON pede int, cuidado se for None.
-                            id_resp_final = int(id_resp) if id_resp and str(id_resp).isdigit() else 0
+                            # 1. Busca TODOS os interessados nesse processo
+                            lista_interessados = database.buscar_todos_solicitantes_por_cnj(cnj)
                             
-                            observacao_str = " | ".join(itens_alterados) # Junta tudo numa string bonita
+                            observacao_str = " | ".join(itens_alterados)
                             
-                            logging.info(f"🔔 Detectada alteração em itens solicitados! Resp: {id_resp_final}")
-                            
-                            lista_para_notificar.append({
-                                "numero_processo": cnj,
-                                "id_responsavel": id_resp_final,
-                                "observacao": observacao_str
-                            })
+                            if not lista_interessados:
+                                logging.warning(f"⚠️ Alteração detectada no {cnj}, mas nenhum solicitante encontrado no banco.")
+                            else:
+                                logging.info(f"🔔 Notificando {len(lista_interessados)} solicitantes sobre o processo {cnj}.")
+
+                                # 2. Cria uma notificação INDIVIDUAL para cada solicitante
+                                for solicitante_id in lista_interessados:
+                                    # Tratamento para garantir que é inteiro (se a API exigir)
+                                    try:
+                                        id_final = int(solicitante_id)
+                                    except:
+                                        id_final = 0 # Fallback se não for número
+
+                                    lista_para_notificar.append({
+                                        "numero_processo": cnj,
+                                        "id_responsavel": id_final,
+                                        "observacao": observacao_str
+                                    })
 
                         # 4. Atualiza o banco com o snapshot novo
                         database.salvar_lista_subsidios(pid, dados_novos)

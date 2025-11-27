@@ -198,21 +198,30 @@ def recuperar_subsidios_anteriores(processo_id):
     finally: cur.close(); conn.close()
     return lista
 
-def buscar_solicitante_por_cnj(cnj):
-    """Busca o ID do solicitante na tabela de tarefas original."""
+
+def buscar_todos_solicitantes_por_cnj(cnj):
+    """
+    Retorna uma LISTA com os IDs de todos os solicitantes distintos 
+    que possuem tarefas registradas para este CNJ.
+    """
     conn = get_connection()
-    if not conn: return None
-    solicitante = None
+    if not conn: return []
+    lista_ids = []
     try:
         cur = conn.cursor()
-        # Pega o solicitante da tarefa mais recente para este CNJ
+        # Seleciona IDs distintos para não notificar a mesma pessoa 2x se ela tiver 2 tarefas
         cur.execute("""
-            SELECT solicitante_id FROM tarefas_legal_one 
-            WHERE processo_cnj = %s 
-            ORDER BY data_criacao DESC LIMIT 1
+            SELECT DISTINCT solicitante_id 
+            FROM tarefas_legal_one 
+            WHERE processo_cnj = %s AND solicitante_id IS NOT NULL
         """, (cnj,))
-        res = cur.fetchone()
-        if res: solicitante = res[0]
-    except: pass
-    finally: cur.close(); conn.close()
-    return solicitante
+        rows = cur.fetchall()
+        for r in rows:
+            if r[0]: # Garante que não é None/Vazio
+                lista_ids.append(r[0])
+    except Exception as e:
+        logging.error(f"Erro ao buscar solicitantes: {e}")
+    finally: 
+        cur.close(); conn.close()
+    
+    return lista_ids
