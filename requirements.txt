@@ -8,3 +8,4 @@ requests
 selenium
 undetected-chromedriver
 psycopg2-binary
+packaging

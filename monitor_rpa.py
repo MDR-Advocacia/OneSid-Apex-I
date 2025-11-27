@@ -2,6 +2,7 @@ import time
 import logging
 import sys
 import os
+import schedule 
 from dotenv import load_dotenv
 
 # Configura logs
@@ -149,6 +150,23 @@ def verificar_processos_em_monitoramento():
         driver.quit()
         logging.info("🏁 Ciclo de monitoramento finalizado.")
 
-if __name__ == "__main__":
-    print("\n--- 🕵️ INICIANDO ROBÔ DE MONITORAMENTO COM NOTIFICAÇÃO ---")
+def job():
+    logging.info("⏰ Iniciando ciclo agendado de monitoramento...")
     verificar_processos_em_monitoramento()
+    logging.info("💤 Ciclo finalizado. Aguardando próximo agendamento.")
+
+if __name__ == "__main__":
+    
+    print("\n--- 🕵️ ROBÔ DE MONITORAMENTO EM EXECUÇÃO (LOOP) ---")
+    
+    # Configura para rodar a cada X minutos (ex: 15 minutos)
+    # Ajuste o tempo conforme a necessidade do negócio
+    schedule.every(15).minutes.do(job)
+    
+    # Executa uma vez imediatamente ao iniciar para não esperar 15 min
+    job()
+
+    # Loop infinito
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
