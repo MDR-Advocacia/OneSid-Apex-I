@@ -3,9 +3,8 @@ import os
 import re
 import logging
 import sys
-import hashlib  # Import para gerar hash dos dados
+import hashlib
 
-# Adiciona o diretório raiz ao path para importar 'bd' corretamente
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import undetected_chromedriver as uc
@@ -14,11 +13,9 @@ from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv
 
-# Módulos do Projeto
 from bd import database
 import apexFluxoLegalOne
 
-# Configuração de Logs
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -27,50 +24,30 @@ logging.basicConfig(
 
 load_dotenv()
 
-# --- FUNÇÃO DE LOGIN REUTILIZÁVEL (BLINDAGEM) ---
-
+# --- FUNÇÃO DE LOGIN REUTILIZÁVEL ---
 def fazer_login(driver):
-    """
-    Realiza o login no portal. Retorna True se sucesso.
-    Verifica se já está logado ou se precisa preencher credenciais.
-    """
     usuario = os.getenv("BB_USUARIO")
     senha = os.getenv("BB_SENHA")
-    
-    if not usuario or not senha:
-        logging.error("❌ Credenciais ausentes no .env")
-        return False
+    if not usuario or not senha: return False
 
-    logging.info("🔐 Iniciando procedimento de Login...")
+    logging.info("🔐 Iniciando Login...")
     try:
         if "sso/XUI" not in driver.current_url and "login" not in driver.current_url:
             driver.get('https://loginweb.bb.com.br/sso/XUI/?realm=/paj&goto=https://juridico.bb.com.br/wfj#login')
         
         wait = WebDriverWait(driver, 60)
-        
         wait.until(EC.visibility_of_element_located((By.ID, "idToken1"))).clear()
         driver.find_element(By.ID, "idToken1").send_keys(usuario)
-        time.sleep(0.5)
-        driver.find_element(By.ID, "loginButton_0").click()
-        
+        time.sleep(0.5); driver.find_element(By.ID, "loginButton_0").click()
         wait.until(EC.visibility_of_element_located((By.ID, "idToken3"))).send_keys(senha)
-        time.sleep(0.5)
+        time.sleep(0.5); wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#loginButton_0[name='callback_4']"))).click()
         
-        wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#loginButton_0[name='callback_4']"))).click()
-        
-        logging.info("✅ Login enviado. Aguardando 15s para estabilização...")
+        logging.info("✅ Login enviado. Aguardando 15s...")
         time.sleep(15)
         return True
-    except Exception as e:
-        logging.error(f"❌ Falha ao realizar login: {e}")
-        try:
-            driver.save_screenshot("erro_login_recuperacao.png")
-        except:
-            pass
-        return False
+    except: return False
 
-# --- FUNÇÕES DE NAVEGAÇÃO E EXTRAÇÃO ---
-
+# --- FUNÇÕES AUXILIARES ---
 def limpar_apenas_digitos(texto):
     if not texto: return ""
     return re.sub(r'\D', '', str(texto))
@@ -96,28 +73,20 @@ def acessar_processo_consulta_rapida(driver, numero_processo):
     if not numero_limpo: return False
     
     url = f"https://juridico.bb.com.br/paj/juridico/v2?app=processoConsultaRapidoTomboApp&numeroTombo={numero_limpo}"
-    logging.info(f"🚀 [NAVEGAÇÃO] Indo para processo: {numero_limpo}")
+    logging.info(f"🚀 [NAVEGAÇÃO] Indo para: {numero_limpo}")
     
     try:
         driver.get(url)
         time.sleep(5) 
-        
         if "sso/XUI" in driver.current_url or len(driver.find_elements(By.ID, "idToken1")) > 0:
-            logging.warning("⚠️ SESSÃO EXPIRADA DETECTADA! Iniciando re-login automático...")
+            logging.warning("⚠️ SESSÃO EXPIRADA! Re-logando...")
             if fazer_login(driver):
-                logging.info("🔄 Sessão recuperada. Retentando acesso...")
-                driver.get(url) 
-                time.sleep(5)
-            else:
-                logging.error("❌ Não foi possível recuperar a sessão.")
-                return False
-        
-        logging.info("⏳ Aguardando carregamento (10s)...")
+                driver.get(url); time.sleep(5)
+            else: return False
+        logging.info("⏳ Aguardando 10s...")
         time.sleep(10)
         return True
-    except Exception as e:
-        logging.error(f"Erro na navegação: {e}")
-        return False
+    except: return False
 
 def extrair_e_acessar_npj(driver):
     logging.info("🔍 Buscando NPJ...")
@@ -139,118 +108,85 @@ def extrair_e_acessar_npj(driver):
         if elemento_npj: break
         time.sleep(3)
 
-    if not elemento_npj:
-        logging.warning("⚠️ NPJ não encontrado (ou lista vazia/confidencial).")
-        return None
+    if not elemento_npj: return None
 
     try:
         texto = elemento_npj.text.strip()
         driver.switch_to.default_content()
-        if not re.search(r"\d{4}/\d+-\d+", texto): 
-            logging.warning(f"⚠️ Texto inválido para NPJ: {texto}")
-            return None
-            
+        if not re.search(r"\d{4}/\d+-\d+", texto): return None
         numeros = limpar_apenas_digitos(texto)
         npj = numeros[:-3] if numeros.endswith('000') else numeros
         if len(npj) < 5: return None
         
-        logging.info(f"✅ NPJ Localizado: {npj}")
+        logging.info(f"✅ NPJ: {npj}")
         driver.get(f"https://juridico.bb.com.br/paj/app/paj-cadastro/spas/processo/consulta/processo-consulta.app.html#/editar/{npj}/0/18")
         time.sleep(10)
         return npj
     except: return None
 
 def coletar_lista_subsidios(driver):
-    """
-    Coleta subsídios com PROTEÇÃO CONTRA LOOP INFINITO.
-    """
     logging.info("📊 Coletando subsídios...")
     lista = []
     xpath = "//tr[contains(@ng-repeat, 'subsidio in vm.resultado.lista')]"
     
     if not buscar_elemento_em_todos_contextos(driver, By.XPATH, xpath):
-        logging.warning("⚠️ Tabela não encontrada/vazia. Verificando erro...")
+        logging.warning("⚠️ Tabela vazia ou não encontrada.")
         return None 
 
-    # Controle de Loop
-    ultimo_hash_pagina = ""
-    pagina_atual = 1
-    MAX_PAGINAS = 50 # Trava de segurança para não rodar eternamente
+    ultimo_hash = ""
+    pag = 1
+    MAX_PAG = 50
 
-    while pagina_atual <= MAX_PAGINAS:
+    while pag <= MAX_PAG:
         try:
-            # 1. Coleta dados da página atual
             elementos = driver.find_elements(By.XPATH, xpath)
             if not elementos and not lista: return None 
 
-            dados_pagina_atual = []
-            texto_bruto_para_hash = ""
+            dados_pag = []
+            str_hash = ""
 
             for linha in elementos:
                 try:
-                    tipo = linha.find_element(By.XPATH, "./td[4]").text.strip()
-                    item = linha.find_element(By.XPATH, "./td[5]").text.strip()
-                    estado = linha.find_element(By.XPATH, "./td[6]").text.strip()
-                    
-                    registro = {"tipo": tipo, "item": item, "estado": estado}
-                    dados_pagina_atual.append(registro)
-                    
-                    # Cria string única para identificar se a página mudou
-                    texto_bruto_para_hash += f"{tipo}{item}{estado}"
+                    t = linha.find_element(By.XPATH, "./td[4]").text.strip()
+                    i = linha.find_element(By.XPATH, "./td[5]").text.strip()
+                    e = linha.find_element(By.XPATH, "./td[6]").text.strip()
+                    dados_pag.append({"tipo": t, "item": i, "estado": e})
+                    str_hash += f"{t}{i}{e}"
                 except: pass
             
-            # 2. Verifica se estamos lendo a MESMA página de novo (Loop Infinito)
-            hash_atual = hashlib.md5(texto_bruto_para_hash.encode('utf-8')).hexdigest()
-            if hash_atual == ultimo_hash_pagina:
-                logging.info(f"⏹️ Detectada página repetida (Hash idêntico). Encerrando paginação na pág {pagina_atual}.")
+            h_atual = hashlib.md5(str_hash.encode()).hexdigest()
+            if h_atual == ultimo_hash:
+                logging.info("⏹️ Página repetida. Fim.")
                 break
+            ultimo_hash = h_atual
             
-            ultimo_hash_pagina = hash_atual
-            
-            # Adiciona os novos dados à lista principal
-            lista.extend(dados_pagina_atual)
-            logging.info(f"   -> Página {pagina_atual} processada. Total coletado: {len(lista)}")
+            lista.extend(dados_pag)
+            logging.info(f"   -> Pág {pag} OK. Total: {len(lista)}")
 
-            # 3. Tenta ir para a próxima
             xpath_prox = "//a[contains(@ng-click, 'vm.rechamarPesquisaProximo()')]"
             try:
                 btn = driver.find_element(By.XPATH, xpath_prox)
-                
-                # Verifica classes e atributos de desabilitado
-                classes_btn = btn.get_attribute("class") or ""
-                is_disabled = btn.get_attribute("disabled")
-                style_btn = btn.get_attribute("style") or "" # Às vezes escondem com display: none
-
-                if "disabled" in classes_btn or is_disabled or "ng-hide" in classes_btn or "display: none" in style_btn:
-                    logging.info("⏹️ Botão 'Próximo' desabilitado/invisível. Fim.")
+                classes = btn.get_attribute("class") or ""
+                style = btn.get_attribute("style") or ""
+                if "disabled" in classes or btn.get_attribute("disabled") or "ng-hide" in classes or "none" in style:
                     break
                 
                 driver.execute_script("arguments[0].scrollIntoView(true);", btn)
                 time.sleep(1)
                 btn.click()
-                
-                logging.info("⏳ Carregando próxima página...")
-                time.sleep(5) # Tempo para a tabela atualizar
-                pagina_atual += 1
-                
-            except Exception:
-                logging.info("⏹️ Botão 'Próximo' não encontrado.")
-                break
-                
-        except Exception as e:
-            logging.error(f"Erro na extração: {e}")
-            break
+                logging.info("⏳ Próxima página...")
+                time.sleep(5)
+                pag += 1
+            except: break
+        except: break
     
-    if pagina_atual > MAX_PAGINAS:
-        logging.warning("⚠️ Limite de segurança de páginas atingido! Loop interrompido forçadamente.")
-
     driver.switch_to.default_content()
     return lista
 
 # --- ORQUESTRADOR ---
 
 def executar_rpa():
-    print("🤖 INICIANDO ORQUESTRADOR (SOLICITAÇÕES DE MONITORAMENTO)")
+    print("🤖 INICIANDO ORQUESTRADOR (MONITORAMENTO INTELIGENTE)")
     database.inicializar_banco()
 
     apexFluxoLegalOne.buscar_e_abastecer_fila()
@@ -272,15 +208,14 @@ def executar_rpa():
 
     try:
         if not fazer_login(driver):
-            logging.error("❌ Falha no login inicial. Abortando.")
+            logging.error("❌ Falha login.")
             return
 
         for tarefa in fila_pendente:
             cnj = tarefa['processo_cnj']
             t_id = tarefa['tarefa_id']
-            solicitante = tarefa['solicitante_id']
             
-            logging.info(f"\n⚙️ Atendendo {solicitante} | CNJ: {cnj}")
+            logging.info(f"\n⚙️ Processando CNJ: {cnj}")
             
             try:
                 if acessar_processo_consulta_rapida(driver, cnj):
@@ -290,25 +225,34 @@ def executar_rpa():
                         if pid:
                             dados = coletar_lista_subsidios(driver)
                             if dados is None:
-                                logging.error("⚠️ Erro tabela. Marcando para retentativa.")
                                 database.marcar_tarefa_concluida(t_id, 'ERRO')
                             else:
                                 if dados: 
                                     database.salvar_lista_subsidios(pid, dados)
                                     logging.info(f"✅ {len(dados)} subsídios salvos.")
-                                else:
-                                    logging.info("✅ Processo sem subsídios.")
+                                    
+                                    # --- NOVO: Lógica de Monitoramento ---
+                                    # Verifica se algum subsídio tem estado "Solicitado" (case insensitive)
+                                    tem_solicitado = any(d['estado'].upper() == 'SOLICITADO' for d in dados)
+                                    
+                                    if tem_solicitado:
+                                        logging.info(f"🚨 ATENÇÃO: Processo {cnj} tem itens 'Solicitado'. Ativando esteira de monitoramento!")
+                                        database.atualizar_status_monitoramento(pid, True)
+                                    else:
+                                        # Opcional: Desativar se não tiver mais pendência?
+                                        # database.atualizar_status_monitoramento(pid, False)
+                                        pass
+
                                 database.marcar_tarefa_concluida(t_id, 'CONCLUIDO')
                         else:
                              database.marcar_tarefa_concluida(t_id, 'ERRO')
                     else:
-                        logging.error("NPJ não achado.")
                         database.marcar_tarefa_concluida(t_id, 'ERRO')
                 else:
                     database.marcar_tarefa_concluida(t_id, 'ERRO')
 
             except Exception as e:
-                logging.error(f"Erro no loop: {e}")
+                logging.error(f"Erro loop: {e}")
                 database.marcar_tarefa_concluida(t_id, 'ERRO')
             
             time.sleep(3)

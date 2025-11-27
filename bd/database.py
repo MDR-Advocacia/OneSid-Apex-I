@@ -21,17 +21,12 @@ def get_connection():
         return None
 
 def inicializar_banco():
-    """
-    Inicializa as tabelas.
-    Inclui migração automática: Se a tabela de tarefas estiver no formato antigo,
-    ela é recriada para incluir o campo 'solicitante_id'.
-    """
     conn = get_connection()
     if not conn: return
     try:
         cur = conn.cursor()
         
-        # 1. Tabelas Core (Processos e Subsídios)
+        # Tabela Processos
         cur.execute("""
             CREATE TABLE IF NOT EXISTS processos (
                 id SERIAL PRIMARY KEY,
@@ -40,6 +35,15 @@ def inicializar_banco():
                 data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        
+        # --- ATUALIZAÇÃO DE SCHEMA (MONITORAMENTO) ---
+        # Adiciona a coluna se ela não existir
+        cur.execute("""
+            ALTER TABLE processos 
+            ADD COLUMN IF NOT EXISTS em_monitoramento BOOLEAN DEFAULT FALSE;
+        """)
+
+        # Tabela Subsídios
         cur.execute("""
             CREATE TABLE IF NOT EXISTS subsidios (
                 id SERIAL PRIMARY KEY,
@@ -51,30 +55,19 @@ def inicializar_banco():
             );
         """)
 
-        # --- CHECAGEM DE MIGRAÇÃO DA TABELA DE TAREFAS ---
-        # Verifica se a tabela existe
+        # Tabela Tarefas (Com checagem de migração antiga mantida)
         cur.execute("SELECT to_regclass('public.tarefas_legal_one')")
-        tabela_existe = cur.fetchone()[0]
-        
-        if tabela_existe:
-            # Verifica se a coluna NOVA 'solicitante_id' existe
-            cur.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name='tarefas_legal_one' AND column_name='solicitante_id';
-            """)
-            # Se a coluna nova NÃO existe, derruba a tabela antiga para recriar
+        if cur.fetchone()[0]:
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='tarefas_legal_one' AND column_name='solicitante_id';")
             if not cur.fetchone():
-                logging.warning("⚠️ Detectado formato antigo da tabela 'tarefas_legal_one'. Recriando para atualização...")
                 cur.execute("DROP TABLE tarefas_legal_one;")
 
-        # 2. Criação da Tabela de Tarefas (Com o schema NOVO)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS tarefas_legal_one (
                 id SERIAL PRIMARY KEY,
                 tarefa_id BIGINT UNIQUE NOT NULL,
                 processo_cnj VARCHAR(50),
-                solicitante_id VARCHAR(50),  -- Campo NOVO (antigo finalizado_por_id)
+                solicitante_id VARCHAR(50),
                 status VARCHAR(20) DEFAULT 'PENDENTE', 
                 data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 data_conclusao TIMESTAMP
@@ -82,7 +75,7 @@ def inicializar_banco():
         """)
         
         conn.commit()
-        logging.info("✅ Banco de dados verificado e atualizado.")
+        logging.info("✅ Banco verificado (Schema Monitoramento OK).")
     except Exception as e:
         logging.error(f"❌ Erro init banco: {e}")
         conn.rollback()
@@ -90,17 +83,13 @@ def inicializar_banco():
         cur.close()
         conn.close()
 
-# --- FUNÇÕES DE FILA (Produtor/Consumidor) ---
+# --- FUNÇÕES DE FILA ---
 
 def inserir_tarefa_na_fila(tarefa_id, cnj, solicitante_id):
-    """
-    Produtor: Insere tarefa na fila.
-    """
     conn = get_connection()
     if not conn: return False
     try:
         cur = conn.cursor()
-        # Usa a coluna solicitante_id
         cur.execute("""
             INSERT INTO tarefas_legal_one (tarefa_id, processo_cnj, solicitante_id, status)
             VALUES (%s, %s, %s, 'PENDENTE')
@@ -109,41 +98,23 @@ def inserir_tarefa_na_fila(tarefa_id, cnj, solicitante_id):
         rows = cur.rowcount
         conn.commit()
         return rows > 0 
-    except Exception as e:
-        logging.error(f"❌ Erro inserir fila: {e}")
-        return False
-    finally:
-        cur.close()
-        conn.close()
+    except: return False
+    finally: cur.close(); conn.close()
 
 def buscar_tarefas_pendentes():
-    """
-    Consumidor: Busca tarefas pendentes.
-    Retorna o dicionário com a chave 'solicitante_id' que o main.py espera.
-    """
     conn = get_connection()
     if not conn: return []
     try:
         cur = conn.cursor()
-        # Seleciona a coluna solicitante_id
         cur.execute("""
             SELECT tarefa_id, processo_cnj, solicitante_id 
             FROM tarefas_legal_one 
             WHERE status IN ('PENDENTE', 'ERRO')
             ORDER BY data_criacao ASC
         """)
-        # Monta o dicionário com a chave correta
-        tarefas = [
-            {"tarefa_id": row[0], "processo_cnj": row[1], "solicitante_id": row[2]} 
-            for row in cur.fetchall()
-        ]
-        return tarefas
-    except Exception as e:
-        logging.error(f"❌ Erro buscar pendentes: {e}")
-        return []
-    finally:
-        cur.close()
-        conn.close()
+        return [{"tarefa_id": r[0], "processo_cnj": r[1], "solicitante_id": r[2]} for r in cur.fetchall()]
+    except: return []
+    finally: cur.close(); conn.close()
 
 def marcar_tarefa_concluida(tarefa_id, status_final='CONCLUIDO'):
     conn = get_connection()
@@ -156,13 +127,10 @@ def marcar_tarefa_concluida(tarefa_id, status_final='CONCLUIDO'):
             WHERE tarefa_id = %s
         """, (status_final, tarefa_id))
         conn.commit()
-    except Exception as e:
-        logging.error(f"❌ Erro atualizar status: {e}")
-    finally:
-        cur.close()
-        conn.close()
+    except: pass
+    finally: cur.close(); conn.close()
 
-# --- FUNÇÕES DE DADOS (Processos/Subsídios) ---
+# --- FUNÇÕES DE DADOS E MONITORAMENTO ---
 
 def salvar_processo(cnj, npj):
     conn = get_connection()
@@ -181,6 +149,24 @@ def salvar_processo(cnj, npj):
         return pid
     except: return None
     finally: cur.close(); conn.close()
+
+def atualizar_status_monitoramento(processo_id, ativar=True):
+    """
+    Ativa ou desativa a flag de monitoramento do processo.
+    """
+    conn = get_connection()
+    if not conn: return
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE processos SET em_monitoramento = %s WHERE id = %s", (ativar, processo_id))
+        conn.commit()
+        status_str = "ATIVADO" if ativar else "DESATIVADO"
+        logging.info(f"👀 Monitoramento {status_str} para processo ID {processo_id}.")
+    except Exception as e:
+        logging.error(f"❌ Erro atualizar monitoramento: {e}")
+    finally:
+        cur.close()
+        conn.close()
 
 def salvar_lista_subsidios(processo_id, lista_dados):
     conn = get_connection()
