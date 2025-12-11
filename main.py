@@ -4,6 +4,7 @@ import re
 import logging
 import sys
 import hashlib
+import schedule 
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -14,11 +15,11 @@ from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv
 
 from bd import database
-import apexFluxoLegalOne
+# import apexFluxoLegalOne  <-- REMOVIDO DO FLUXO, agora roda separado
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - [PORTAL RPA] %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 
@@ -194,20 +195,21 @@ def coletar_lista_subsidios(driver):
     driver.switch_to.default_content()
     return lista
 
-# --- ORQUESTRADOR ---
+# --- ORQUESTRADOR DE PROCESSAMENTO ---
 
-def executar_rpa():
-    print("🤖 INICIANDO ORQUESTRADOR (MONITORAMENTO INTELIGENTE)")
+def job_processar_portal():
+    logging.info("🏁 Iniciando ciclo de processamento no Portal...")
     database.inicializar_banco()
 
-    apexFluxoLegalOne.buscar_e_abastecer_fila()
+    # REMOVIDO: apexFluxoLegalOne.buscar_e_abastecer_fila()
+    # Agora só olha o que já está no banco:
     fila_pendente = database.buscar_tarefas_pendentes()
     
     if not fila_pendente:
-        logging.info("✅ Nenhuma solicitação pendente.")
+        logging.info("✅ Nenhuma tarefa pendente no banco.")
         return
 
-    logging.info(f"📋 Processando {len(fila_pendente)} solicitações...")
+    logging.info(f"📋 Processando {len(fila_pendente)} tarefas da fila...")
 
     usuario_env = os.getenv("BB_USUARIO")
     senha_env = os.getenv("BB_SENHA")
@@ -242,17 +244,12 @@ def executar_rpa():
                                     database.salvar_lista_subsidios(pid, dados)
                                     logging.info(f"✅ {len(dados)} subsídios salvos.")
                                     
-                                    # --- NOVO: Lógica de Monitoramento ---
-                                    # Verifica se algum subsídio tem estado "Solicitado" (case insensitive)
+                                    # Verifica se precisa ativar monitoramento
                                     tem_solicitado = any(d['estado'].upper() == 'SOLICITADO' for d in dados)
                                     
                                     if tem_solicitado:
-                                        logging.info(f"🚨 ATENÇÃO: Processo {cnj} tem itens 'Solicitado'. Ativando esteira de monitoramento!")
+                                        logging.info(f"🚨 ATENÇÃO: Processo {cnj} tem itens 'Solicitado'. Ativando monitoramento!")
                                         database.atualizar_status_monitoramento(pid, True)
-                                    else:
-                                        # Opcional: Desativar se não tiver mais pendência?
-                                        # database.atualizar_status_monitoramento(pid, False)
-                                        pass
 
                                 database.marcar_tarefa_concluida(t_id, 'CONCLUIDO')
                         else:
@@ -270,6 +267,18 @@ def executar_rpa():
 
     finally:
         driver.quit()
+        logging.info("💤 Ciclo de processamento finalizado.")
 
 if __name__ == "__main__":
-    executar_rpa()
+    
+    print("\n--- 🤖 ROBÔ PROCESSADOR PORTAL (5 em 5 min) ---")
+    
+    # Executa a primeira vez
+    job_processar_portal()
+    
+    # Agenda para rodar a cada 5 minutos
+    schedule.every(5).minutes.do(job_processar_portal)
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
