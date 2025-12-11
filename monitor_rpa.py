@@ -86,15 +86,21 @@ def verificar_processos_em_monitoramento():
                         for antigo in subsidios_antigos:
                             # Só nos interessa o que estava "SOLICITADO" (case insensitive)
                             if antigo['estado'].upper() == 'SOLICITADO':
-                                # Busca esse mesmo item na lista nova (pelo Tipo e Item)
+                                
+                                # Busca correspondente usando TIPO + ITEM + DATA_LIMITE (Chave Composta)
                                 correspondente_novo = next(
-                                    (n for n in dados_novos if n['item'] == antigo['item'] and n['tipo'] == antigo['tipo']), 
+                                    (n for n in dados_novos if 
+                                        n['item'] == antigo['item'] and 
+                                        n['tipo'] == antigo['tipo'] and
+                                        n.get('data_limite') == antigo.get('data_limite') # Nova chave
+                                    ), 
                                     None
                                 )
                                 
                                 # Se achou e o estado mudou (não é mais SOLICITADO), então houve andamento!
                                 if correspondente_novo and correspondente_novo['estado'].upper() != 'SOLICITADO':
-                                    msg = f"{correspondente_novo['tipo']} {correspondente_novo['item']} {correspondente_novo['estado']}"
+                                    dt_info = f" ({correspondente_novo.get('data_limite')})" if correspondente_novo.get('data_limite') else ""
+                                    msg = f"{correspondente_novo['tipo']} {correspondente_novo['item']}{dt_info}: {correspondente_novo['estado']}"
                                     itens_alterados.append(msg)
 
                         # Se detectamos alterações relevantes, prepara para envio
@@ -123,7 +129,7 @@ def verificar_processos_em_monitoramento():
                                         "observacao": observacao_str
                                     })
 
-                        # 4. Atualiza o banco com o snapshot novo
+                        # 4. Atualiza o banco com o snapshot novo (incluindo as datas)
                         database.salvar_lista_subsidios(pid, dados_novos)
                         
                         # 5. Verifica se desliga o monitoramento
@@ -160,7 +166,6 @@ if __name__ == "__main__":
     print("\n--- 🕵️ ROBÔ DE MONITORAMENTO EM EXECUÇÃO (LOOP) ---")
     
     # Configura para rodar a cada X minutos (ex: 15 minutos)
-    # Ajuste o tempo conforme a necessidade do negócio
     schedule.every(15).minutes.do(job)
     
     # Executa uma vez imediatamente ao iniciar para não esperar 15 min

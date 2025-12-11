@@ -34,62 +34,78 @@ def make_api_request(url, params):
 def buscar_e_abastecer_fila():
     """
     Função Principal do Produtor:
-    1. Busca tarefas na API.
-    2. Insere no Banco como PENDENTE.
+    1. Define os tipos de tarefas desejados.
+    2. Itera sobre cada tipo, buscando até 30 tarefas recentes para CADA um.
+    3. Insere no Banco como PENDENTE.
     """
     if not CLIENT_ID or not CLIENT_SECRET:
         print("⚠️ Credenciais Legal One ausentes.")
         return
 
-    print("📡 [APEX] Buscando tarefas no Legal One...")
-    
-    # 1. Busca Candidatas
-    params = {
-        "$filter": "(typeId eq 30 and subTypeId eq 1195) and statusId eq 1 and relationships/any(r: r/linkType eq 'Litigation')",
-        "$expand": "relationships($select=id,linkId)",
-        "$select": "id,finishedBy,relationships",
-        "$top": 30,
-        "$orderby": "id desc"
-    }
-    
-    try:
-        url = f"{BASE_URL}/tasks"
-        data = make_api_request(url, params)
-        tasks = data.get("value", [])
-    except Exception as e:
-        print(f"❌ Erro API: {e}")
-        return
+    print("📡 [APEX] Iniciando ciclo de busca por tipo de tarefa...")
 
-    if not tasks:
-        print("📭 Nenhuma tarefa encontrada na API.")
-        return
+    # Lista de configurações de tarefas para iterar
+    tipos_tarefa = [
+        {"typeId": 30, "subTypeId": 1195},
+        {"typeId": 28, "subTypeId": 961},
+        {"typeId": 28, "subTypeId": 936},
+        {"typeId": 28, "subTypeId": 984}
+    ]
 
-    print(f"🔎 Encontradas {len(tasks)} tarefas na API. Verificando CNJs...")
-    
-    count_novas = 0
-    for task in tasks:
-        task_id = task.get('id')
-        user_id = task.get('finishedBy')
+    count_novas_total = 0
+
+    for config in tipos_tarefa:
+        t_id = config['typeId']
+        s_id = config['subTypeId']
+
+        print(f"\n🔎 Buscando TOP 30 para: TypeId {t_id} / SubTypeId {s_id}")
         
-        # Pega CNJ
-        relationships = task.get('relationships', [])
-        litigation_id = relationships[0].get('linkId') if relationships else None
+        params = {
+            "$filter": f"(typeId eq {t_id} and subTypeId eq {s_id}) and statusId eq 1 and relationships/any(r: r/linkType eq 'Litigation')",
+            "$expand": "relationships($select=id,linkId)",
+            "$select": "id,finishedBy,relationships",
+            "$top": 30,
+            "$orderby": "id desc"
+        }
         
-        cnj = None
-        if litigation_id:
-            try:
-                lit_url = f"{BASE_URL}/litigations/{litigation_id}?$select=identifierNumber"
-                lit_data = make_api_request(lit_url, {})
-                cnj = lit_data.get('identifierNumber')
-            except: pass
+        try:
+            url = f"{BASE_URL}/tasks"
+            data = make_api_request(url, params)
+            tasks = data.get("value", [])
+        except Exception as e:
+            print(f"❌ Erro API ao buscar tipo {t_id}/{s_id}: {e}")
+            continue
+
+        if not tasks:
+            print(f"   📭 Nenhuma tarefa encontrada para este tipo.")
+            continue
+
+        print(f"   📋 Processando {len(tasks)} tarefas encontradas...")
         
-        if cnj:
-            # Tenta inserir na fila. Se retornar True, é nova.
-            if database.inserir_tarefa_na_fila(task_id, cnj, user_id):
-                print(f"   -> Nova tarefa na fila: {task_id} (CNJ: {cnj})")
-                count_novas += 1
+        for task in tasks:
+            task_id = task.get('id')
+            user_id = task.get('finishedBy')
+            
+            # Pega CNJ
+            relationships = task.get('relationships', [])
+            litigation_id = relationships[0].get('linkId') if relationships else None
+            
+            cnj = None
+            if litigation_id:
+                try:
+                    # Aqui, idealmente, poderia haver cache para não consultar o mesmo litigation repetidamente
+                    lit_url = f"{BASE_URL}/litigations/{litigation_id}?$select=identifierNumber"
+                    lit_data = make_api_request(lit_url, {})
+                    cnj = lit_data.get('identifierNumber')
+                except: pass
+            
+            if cnj:
+                # Tenta inserir na fila. Se retornar True, é nova.
+                if database.inserir_tarefa_na_fila(task_id, cnj, user_id):
+                    print(f"   -> Nova tarefa na fila: {task_id} (CNJ: {cnj})")
+                    count_novas_total += 1
         
-    print(f"✅ Abastecimento concluído. {count_novas} tarefas novas inseridas na fila.")
+    print(f"\n✅ Ciclo concluído. Total de tarefas novas inseridas: {count_novas_total}")
 
 if __name__ == "__main__":
     buscar_e_abastecer_fila()

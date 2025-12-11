@@ -37,7 +37,7 @@ def inicializar_banco():
         """)
         
         # --- ATUALIZAÇÃO DE SCHEMA (MONITORAMENTO) ---
-        # Adiciona a coluna se ela não existir
+        # Adiciona a coluna em_monitoramento se ela não existir
         cur.execute("""
             ALTER TABLE processos 
             ADD COLUMN IF NOT EXISTS em_monitoramento BOOLEAN DEFAULT FALSE;
@@ -51,9 +51,15 @@ def inicializar_banco():
                 tipo VARCHAR(255),
                 item TEXT,
                 estado VARCHAR(100),
+                data_limite VARCHAR(20),
                 data_extracao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        
+        # --- MIGRACAO: Adiciona data_limite em bancos ja existentes ---
+        try:
+            cur.execute("ALTER TABLE subsidios ADD COLUMN IF NOT EXISTS data_limite VARCHAR(20);")
+        except: pass
 
         # Tabela Tarefas (Com checagem de migração antiga mantida)
         cur.execute("SELECT to_regclass('public.tarefas_legal_one')")
@@ -75,7 +81,7 @@ def inicializar_banco():
         """)
         
         conn.commit()
-        logging.info("✅ Banco verificado (Schema Monitoramento OK).")
+        logging.info("✅ Banco verificado (Schema Monitoramento + Data Limite OK).")
     except Exception as e:
         logging.error(f"❌ Erro init banco: {e}")
         conn.rollback()
@@ -175,12 +181,15 @@ def salvar_lista_subsidios(processo_id, lista_dados):
         cur = conn.cursor()
         cur.execute("DELETE FROM subsidios WHERE processo_id = %s", (processo_id,))
         for d in lista_dados:
+            # Obtem data limite, padrao vazio se nao existir
+            data_lim = d.get('data_limite', '')
             cur.execute(
-                "INSERT INTO subsidios (processo_id, tipo, item, estado) VALUES (%s, %s, %s, %s)",
-                (processo_id, d['tipo'], d['item'], d['estado'])
+                "INSERT INTO subsidios (processo_id, tipo, item, estado, data_limite) VALUES (%s, %s, %s, %s, %s)",
+                (processo_id, d['tipo'], d['item'], d['estado'], data_lim)
             )
         conn.commit()
-    except: pass
+    except Exception as e:
+        logging.error(f"Erro salvar subsidios: {e}")
     finally: cur.close(); conn.close()
 
 def recuperar_subsidios_anteriores(processo_id):
@@ -190,10 +199,15 @@ def recuperar_subsidios_anteriores(processo_id):
     lista = []
     try:
         cur = conn.cursor()
-        cur.execute("SELECT tipo, item, estado FROM subsidios WHERE processo_id = %s", (processo_id,))
+        cur.execute("SELECT tipo, item, estado, data_limite FROM subsidios WHERE processo_id = %s", (processo_id,))
         rows = cur.fetchall()
         for r in rows:
-            lista.append({"tipo": r[0], "item": r[1], "estado": r[2]})
+            lista.append({
+                "tipo": r[0], 
+                "item": r[1], 
+                "estado": r[2], 
+                "data_limite": r[3]
+            })
     except: pass
     finally: cur.close(); conn.close()
     return lista

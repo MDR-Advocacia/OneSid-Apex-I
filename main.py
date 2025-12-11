@@ -147,11 +147,22 @@ def coletar_lista_subsidios(driver):
 
             for linha in elementos:
                 try:
+                    # Tenta capturar data da coluna 3 usando Regex
+                    raw_data = linha.find_element(By.XPATH, "./td[3]").text.strip()
+                    match_data = re.search(r'(\d{2}/\d{2}/\d{4})', raw_data)
+                    data_limite = match_data.group(1) if match_data else ""
+
                     t = linha.find_element(By.XPATH, "./td[4]").text.strip()
                     i = linha.find_element(By.XPATH, "./td[5]").text.strip()
                     e = linha.find_element(By.XPATH, "./td[6]").text.strip()
-                    dados_pag.append({"tipo": t, "item": i, "estado": e})
-                    str_hash += f"{t}{i}{e}"
+                    
+                    dados_pag.append({
+                        "tipo": t, 
+                        "item": i, 
+                        "estado": e, 
+                        "data_limite": data_limite
+                    })
+                    str_hash += f"{t}{i}{e}{data_limite}"
                 except: pass
             
             h_atual = hashlib.md5(str_hash.encode()).hexdigest()
