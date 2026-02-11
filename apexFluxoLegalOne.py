@@ -46,10 +46,16 @@ def buscar_e_abastecer_fila():
 
     # Lista de configurações de tarefas para iterar
     tipos_tarefa = [
-        {"typeId": 30, "subTypeId": 1195},
-        {"typeId": 28, "subTypeId": 961},
-        {"typeId": 28, "subTypeId": 936},
-        {"typeId": 28, "subTypeId": 984}
+        {"typeId": 30, "subTypeId": 1195}, # Teste - ONESID
+        {"typeId": 28, "subTypeId": 961}, # Quesito - BB Autor
+        {"typeId": 28, "subTypeId": 936}, # Apresentar  Planilha - BB Autor
+        {"typeId": 26, "subTypeId": 1131}, # Solicitar  Monitoramento - ONESID
+        {"typeId": 15, "subTypeId": 856}, # Solicitar Subsídio / Tarefa - Luna 12/01
+        {"typeId": 13, "subTypeId": 843}, # Solicitar Subsídio / Tarefa - Luna 12/01
+        {"typeId": 28, "subTypeId": 984}, # Solicitar Preposto
+        {"typeId": 20, "subTypeId": 975}, # Obrigação de Fazer Complexa - Jonilson 28/01
+        {"typeId": 20, "subTypeId": 1139} # Obrigação de Fazer Simples  - Jonilson 28/01
+
     ]
 
     count_novas_total = 0
