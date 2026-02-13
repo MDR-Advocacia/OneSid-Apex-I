@@ -1,7 +1,6 @@
 services:
 
   # --- BANCO DE DADOS ---
-  # Apenas o Postgres vai rodar no Docker
   db:
     image: postgres:15-alpine
     container_name: onesid-postgres
@@ -11,11 +10,19 @@ services:
       - POSTGRES_PASSWORD=postgres
       - POSTGRES_DB=onesid_db
     ports:
-      # Expõe a porta 5432 do container para a 5432 do seu PC
       - "5432:5432" 
     volumes:
-      # Salva os dados na pasta 'postgres_data' do seu projeto
       - ./postgres_data:/var/lib/postgresql/data 
+    networks:
+      - onesid-net
+
+  # --- LOKI (Coletor de Logs) ---
+  loki:
+    image: grafana/loki:2.9.2
+    container_name: onesid-loki
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
     networks:
       - onesid-net
 

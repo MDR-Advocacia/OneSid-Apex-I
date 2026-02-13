@@ -3,13 +3,25 @@ import logging
 import sys
 import os
 import schedule 
+import logging_loki
 from dotenv import load_dotenv
 
-# Configura logs
+# Garante que a pasta de logs existe
+os.makedirs("logs", exist_ok=True)
+
+# Configura logs (Tela + Arquivo + Loki)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [MONITOR] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('logs/monitor.log', encoding='utf-8'),
+        logging_loki.LokiQueueHandler(
+            url="http://localhost:3100/loki/api/v1/push",
+            tags={"application": "onesid-apex", "service": "monitor"},
+            version="1",
+        )
+    ]
 )
 
 load_dotenv("RPA/.env")
@@ -52,7 +64,7 @@ def verificar_processos_em_monitoramento():
 
     logging.info(f"📋 Encontrados {len(processos_monitorados)} processos para verificar.")
 
-    driver = rpa_core.uc.Chrome(options=rpa_core.uc.ChromeOptions(), use_subprocess=True, version_main=142)
+    driver = rpa_core.uc.Chrome(options=rpa_core.uc.ChromeOptions(), use_subprocess=True, version_main=144)
     
     lista_para_notificar = []
 

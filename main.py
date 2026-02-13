@@ -5,6 +5,7 @@ import logging
 import sys
 import hashlib
 import schedule 
+import logging_loki
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -15,12 +16,23 @@ from selenium.webdriver.support import expected_conditions as EC
 from dotenv import load_dotenv
 
 from bd import database
-# import apexFluxoLegalOne  <-- REMOVIDO DO FLUXO, agora roda separado
 
+# Garante que a pasta de logs existe
+os.makedirs("logs", exist_ok=True)
+
+# Configura logs (Tela + Arquivo + Loki)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [PORTAL RPA] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('logs/processador.log', encoding='utf-8'),
+        logging_loki.LokiQueueHandler(
+            url="http://localhost:3100/loki/api/v1/push",
+            tags={"application": "onesid-apex", "service": "processador"},
+            version="1",
+        )
+    ]
 )
 
 load_dotenv()
@@ -217,7 +229,7 @@ def job_processar_portal():
 
     options = uc.ChromeOptions()
     options.add_argument("--start-maximized")
-    driver = uc.Chrome(options=options, use_subprocess=True, version_main=142)
+    driver = uc.Chrome(options=options, use_subprocess=True, version_main=144)
 
     try:
         if not fazer_login(driver):

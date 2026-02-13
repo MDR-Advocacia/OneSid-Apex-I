@@ -3,13 +3,25 @@ import logging
 import sys
 import os
 import schedule 
+import logging_loki
 from dotenv import load_dotenv
 
-# Configura logs
+# Garante que a pasta de logs existe
+os.makedirs("logs", exist_ok=True)
+
+# Configura logs (Tela + Arquivo + Loki)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [LEGAL ONE] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('logs/coletor.log', encoding='utf-8'),
+        logging_loki.LokiQueueHandler(
+            url="http://localhost:3100/loki/api/v1/push",
+            tags={"application": "onesid-apex", "service": "coletor"},
+            version="1",
+        )
+    ]
 )
 
 load_dotenv()
