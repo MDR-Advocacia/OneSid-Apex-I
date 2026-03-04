@@ -16,8 +16,8 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler('logs/monitor.log', encoding='utf-8'),
-        logging_loki.LokiQueueHandler(
-            url="http://localhost:3100/loki/api/v1/push",
+        logging_loki.LokiHandler( 
+            url="http://loki:3100/loki/api/v1/push",  
             tags={"application": "onesid-apex", "service": "monitor"},
             version="1",
         )
@@ -73,7 +73,7 @@ def verificar_processos_em_monitoramento():
 
     driver = rpa_core.uc.Chrome(options=options, use_subprocess=True, version_main=144)
 
-    
+
     lista_para_notificar = []
 
     try:

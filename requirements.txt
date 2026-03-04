@@ -9,3 +9,4 @@ selenium
 undetected-chromedriver
 psycopg2-binary
 packaging
+python-logging-loki

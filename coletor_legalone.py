@@ -16,8 +16,8 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler('logs/coletor.log', encoding='utf-8'),
-        logging_loki.LokiQueueHandler(
-            url="http://localhost:3100/loki/api/v1/push",
+        logging_loki.LokiHandler(  # <-- ALTERADO AQUI
+            url="http://loki:3100/loki/api/v1/push", 
             tags={"application": "onesid-apex", "service": "coletor"},
             version="1",
         )
