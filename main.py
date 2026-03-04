@@ -229,6 +229,10 @@ def job_processar_portal():
 
     options = uc.ChromeOptions()
     options.add_argument("--start-maximized")
+    options.add_argument("--headless=new") # <- ADICIONE ESTA LINHA!
+    options.add_argument("--no-sandbox")   # <- MUITO IMPORTANTE NO DOCKER!
+    options.add_argument("--disable-dev-shm-usage") # <- EVITA QUE O CHROME TRAVE NO DOCKER
+    
     driver = uc.Chrome(options=options, use_subprocess=True, version_main=144)
 
     try:

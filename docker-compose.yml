@@ -1,4 +1,20 @@
+version: '3.8'
+
 services:
+  # --- NOSSO PAINEL E ROBÔS ---
+  app-rpa:
+    build: .
+    container_name: onesid-rpa-panel
+    restart: always
+    ports:
+      - "5000:5000" # Porta para você acessar no navegador
+    volumes:
+      - .:/app # Permite que alterações no código reflitam sem recriar o container
+    depends_on:
+      - db
+      - loki
+    networks:
+      - onesid-net
 
   # --- BANCO DE DADOS ---
   db:

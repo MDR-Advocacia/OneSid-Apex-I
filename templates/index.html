@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Painel de Controle - OneSid Apex</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #1e1e2f; color: #fff; padding: 20px; }
+        .log-box { background-color: #000; color: #0f0; height: 400px; overflow-y: auto; padding: 10px; font-family: monospace; font-size: 12px; border-radius: 5px; }
+        .card { background-color: #2a2a3b; border: none; }
+        .card-header { font-weight: bold; border-bottom: 1px solid #444; }
+    </style>
+</head>
+<body>
+    <h2 class="text-center mb-4"> Painel OneSid Apex</h2>
+    <div class="row">
+        <div class="col-md-4">
+            <div class="card text-white mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>📡 Coletor <span id="status-coletor">...</span></span>
+                    <button class="btn btn-sm btn-warning" onclick="reiniciar('coletor')">Reiniciar</button>
+                </div>
+                <div class="card-body p-0">
+                    <pre class="log-box" id="log-coletor">Carregando...</pre>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card text-white mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span> Processador <span id="status-processador">...</span></span>
+                    <button class="btn btn-sm btn-warning" onclick="reiniciar('processador')">Reiniciar</button>
+                </div>
+                <div class="card-body p-0">
+                    <pre class="log-box" id="log-processador">Carregando...</pre>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card text-white mb-3">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span>🕵️ Monitor <span id="status-monitor">...</span></span>
+                    <button class="btn btn-sm btn-warning" onclick="reiniciar('monitor')">Reiniciar</button>
+                </div>
+                <div class="card-body p-0">
+                    <pre class="log-box" id="log-monitor">Carregando...</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function atualizarLogs() {
+            ['coletor', 'processador', 'monitor'].forEach(robo => {
+                fetch(`/api/logs/${robo}`)
+                    .then(res => res.json())
+                    .then(data => {
+                        let logBox = document.getElementById(`log-${robo}`);
+                        logBox.textContent = data.logs;
+                        logBox.scrollTop = logBox.scrollHeight; // Rola para o final
+                    });
+            });
+        }
+
+        function atualizarStatus() {
+            fetch('/api/status')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('status-coletor').textContent = data.coletor;
+                    document.getElementById('status-processador').textContent = data.processador;
+                    document.getElementById('status-monitor').textContent = data.monitor;
+                });
+        }
+
+        function reiniciar(robo) {
+            if(confirm(`Tem certeza que deseja reiniciar o ${robo}?`)) {
+                fetch(`/api/restart/${robo}`, { method: 'POST' })
+                    .then(res => res.json())
+                    .then(data => alert(data.message));
+            }
+        }
+
+        // Atualiza a tela a cada 3 segundos
+        setInterval(atualizarLogs, 3000);
+        setInterval(atualizarStatus, 3000);
+        atualizarStatus();
+    </script>
+</body>
+</html>

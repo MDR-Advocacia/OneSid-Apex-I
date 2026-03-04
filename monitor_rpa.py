@@ -64,7 +64,15 @@ def verificar_processos_em_monitoramento():
 
     logging.info(f"📋 Encontrados {len(processos_monitorados)} processos para verificar.")
 
-    driver = rpa_core.uc.Chrome(options=rpa_core.uc.ChromeOptions(), use_subprocess=True, version_main=144)
+    # Configurar as opções para o Docker (Headless)
+    options = rpa_core.uc.ChromeOptions()
+    options.add_argument("--start-maximized")
+    options.add_argument("--headless=new") 
+    options.add_argument("--no-sandbox")   
+    options.add_argument("--disable-dev-shm-usage") 
+
+    driver = rpa_core.uc.Chrome(options=options, use_subprocess=True, version_main=144)
+
     
     lista_para_notificar = []
 
