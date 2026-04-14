@@ -2,29 +2,28 @@ import time
 import logging
 import sys
 import os
-import schedule 
-import logging_loki
 from dotenv import load_dotenv
+
+from app_logging import build_logging_handlers
 
 # Garante que a pasta de logs existe
 os.makedirs("logs", exist_ok=True)
+loki_handlers, loki_enabled = build_logging_handlers(
+    "logs/coletor.log",
+    service="coletor",
+)
 
 # Configura logs (Tela + Arquivo + Loki)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - [LEGAL ONE] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('logs/coletor.log', encoding='utf-8'),
-        logging_loki.LokiQueueHandler(
-            url="http://localhost:3100/loki/api/v1/push",
-            tags={"application": "onesid-apex", "service": "coletor"},
-            version="1",
-        )
-    ]
+    handlers=loki_handlers
 )
 
 load_dotenv()
+
+if not loki_enabled:
+    logging.warning("logging_loki não instalado. Logs seguirão apenas para stdout/arquivo.")
 
 # Ajuste de Path para garantir importações
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
@@ -51,6 +50,8 @@ def job_coleta():
     logging.info("💤 Coleta finalizada. Aguardando próximo ciclo.")
 
 if __name__ == "__main__":
+    import schedule
+
     print("\n--- 📡 ROBÔ COLETOR LEGAL ONE (20 em 20 min) ---")
     
     # Executa imediatamente na partida

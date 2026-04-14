@@ -23,6 +23,7 @@ def get_connection():
 def inicializar_banco():
     conn = get_connection()
     if not conn: return
+    cur = None
     try:
         cur = conn.cursor()
         
@@ -59,7 +60,8 @@ def inicializar_banco():
         # --- MIGRACAO: Adiciona data_limite em bancos ja existentes ---
         try:
             cur.execute("ALTER TABLE subsidios ADD COLUMN IF NOT EXISTS data_limite VARCHAR(20);")
-        except: pass
+        except Exception as e:
+            logging.warning(f"⚠️ Não foi possível ajustar data_limite em subsidios: {e}")
 
         # Tabela Tarefas (Com checagem de migração antiga mantida)
         cur.execute("SELECT to_regclass('public.tarefas_legal_one')")
@@ -79,6 +81,16 @@ def inicializar_banco():
                 data_conclusao TIMESTAMP
             );
         """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS coleta_legalone_cursor (
+                type_id BIGINT NOT NULL,
+                sub_type_id BIGINT NOT NULL,
+                ultimo_task_id BIGINT,
+                atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (type_id, sub_type_id)
+            );
+        """)
         
         conn.commit()
         logging.info("✅ Banco verificado (Schema Monitoramento + Data Limite OK).")
@@ -86,7 +98,8 @@ def inicializar_banco():
         logging.error(f"❌ Erro init banco: {e}")
         conn.rollback()
     finally:
-        cur.close()
+        if cur:
+            cur.close()
         conn.close()
 
 # --- FUNÇÕES DE FILA ---
@@ -94,6 +107,7 @@ def inicializar_banco():
 def inserir_tarefa_na_fila(tarefa_id, cnj, solicitante_id):
     conn = get_connection()
     if not conn: return False
+    cur = None
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -103,13 +117,19 @@ def inserir_tarefa_na_fila(tarefa_id, cnj, solicitante_id):
         """, (tarefa_id, cnj, solicitante_id))
         rows = cur.rowcount
         conn.commit()
-        return rows > 0 
-    except: return False
-    finally: cur.close(); conn.close()
+        return True if rows > 0 else False
+    except Exception as e:
+        logging.error(f"Erro ao inserir tarefa {tarefa_id} na fila: {e}")
+        return None
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
 
 def buscar_tarefas_pendentes():
     conn = get_connection()
     if not conn: return []
+    cur = None
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -119,12 +139,84 @@ def buscar_tarefas_pendentes():
             ORDER BY data_criacao ASC
         """)
         return [{"tarefa_id": r[0], "processo_cnj": r[1], "solicitante_id": r[2]} for r in cur.fetchall()]
-    except: return []
-    finally: cur.close(); conn.close()
+    except Exception as e:
+        logging.error(f"Erro ao buscar tarefas pendentes: {e}")
+        return []
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def obter_cursor_coleta(type_id, sub_type_id):
+    conn = get_connection()
+    if not conn:
+        return None
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT ultimo_task_id
+            FROM coleta_legalone_cursor
+            WHERE type_id = %s AND sub_type_id = %s
+            """,
+            (type_id, sub_type_id),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        logging.error(
+            "Erro ao obter cursor da coleta para type_id=%s sub_type_id=%s: %s",
+            type_id,
+            sub_type_id,
+            e,
+        )
+        return None
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def atualizar_cursor_coleta(type_id, sub_type_id, ultimo_task_id):
+    conn = get_connection()
+    if not conn:
+        return False
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO coleta_legalone_cursor (type_id, sub_type_id, ultimo_task_id, atualizado_em)
+            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (type_id, sub_type_id) DO UPDATE
+            SET ultimo_task_id = EXCLUDED.ultimo_task_id,
+                atualizado_em = CURRENT_TIMESTAMP
+            """,
+            (type_id, sub_type_id, ultimo_task_id),
+        )
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(
+            "Erro ao atualizar cursor da coleta para type_id=%s sub_type_id=%s: %s",
+            type_id,
+            sub_type_id,
+            e,
+        )
+        return False
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
 
 def marcar_tarefa_concluida(tarefa_id, status_final='CONCLUIDO'):
     conn = get_connection()
     if not conn: return
+    cur = None
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -133,14 +225,19 @@ def marcar_tarefa_concluida(tarefa_id, status_final='CONCLUIDO'):
             WHERE tarefa_id = %s
         """, (status_final, tarefa_id))
         conn.commit()
-    except: pass
-    finally: cur.close(); conn.close()
+    except Exception as e:
+        logging.error(f"Erro ao atualizar status da tarefa {tarefa_id}: {e}")
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
 
 # --- FUNÇÕES DE DADOS E MONITORAMENTO ---
 
 def salvar_processo(cnj, npj):
     conn = get_connection()
     if not conn: return None
+    cur = None
     try:
         cur = conn.cursor()
         cur.execute("""
@@ -153,8 +250,13 @@ def salvar_processo(cnj, npj):
         pid = cur.fetchone()[0]
         conn.commit()
         return pid
-    except: return None
-    finally: cur.close(); conn.close()
+    except Exception as e:
+        logging.error(f"Erro ao salvar processo {cnj}/{npj}: {e}")
+        return None
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
 
 def atualizar_status_monitoramento(processo_id, ativar=True):
     """
@@ -162,6 +264,7 @@ def atualizar_status_monitoramento(processo_id, ativar=True):
     """
     conn = get_connection()
     if not conn: return
+    cur = None
     try:
         cur = conn.cursor()
         cur.execute("UPDATE processos SET em_monitoramento = %s WHERE id = %s", (ativar, processo_id))
@@ -171,32 +274,131 @@ def atualizar_status_monitoramento(processo_id, ativar=True):
     except Exception as e:
         logging.error(f"❌ Erro atualizar monitoramento: {e}")
     finally:
-        cur.close()
+        if cur:
+            cur.close()
         conn.close()
 
 def salvar_lista_subsidios(processo_id, lista_dados):
     conn = get_connection()
     if not conn: return
+    cur = None
     try:
         cur = conn.cursor()
-        cur.execute("DELETE FROM subsidios WHERE processo_id = %s", (processo_id,))
-        for d in lista_dados:
-            # Obtem data limite, padrao vazio se nao existir
-            data_lim = d.get('data_limite', '')
+        cur.execute(
+            """
+            SELECT id, tipo, item, estado, COALESCE(data_limite, '')
+            FROM subsidios
+            WHERE processo_id = %s
+            ORDER BY id ASC
+            """,
+            (processo_id,),
+        )
+        existentes = [
+            {
+                "id": row[0],
+                "tipo": row[1] or "",
+                "item": row[2] or "",
+                "estado": row[3] or "",
+                "data_limite": row[4] or "",
+            }
+            for row in cur.fetchall()
+        ]
+
+        usados = set()
+        preservados = set()
+
+        for dado in lista_dados:
+            normalizado = _normalizar_subsidio(dado)
+            existente = _buscar_subsidio_existente(existentes, normalizado, usados)
+
+            if existente:
+                cur.execute(
+                    """
+                    UPDATE subsidios
+                    SET tipo = %s,
+                        item = %s,
+                        estado = %s,
+                        data_limite = %s,
+                        data_extracao = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                    """,
+                    (
+                        normalizado["tipo"],
+                        normalizado["item"],
+                        normalizado["estado"],
+                        normalizado["data_limite"],
+                        existente["id"],
+                    ),
+                )
+                usados.add(existente["id"])
+                preservados.add(existente["id"])
+                continue
+
             cur.execute(
-                "INSERT INTO subsidios (processo_id, tipo, item, estado, data_limite) VALUES (%s, %s, %s, %s, %s)",
-                (processo_id, d['tipo'], d['item'], d['estado'], data_lim)
+                """
+                INSERT INTO subsidios (processo_id, tipo, item, estado, data_limite)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    processo_id,
+                    normalizado["tipo"],
+                    normalizado["item"],
+                    normalizado["estado"],
+                    normalizado["data_limite"],
+                ),
             )
+
+        for existente in existentes:
+            if existente["id"] in preservados:
+                continue
+            cur.execute("DELETE FROM subsidios WHERE id = %s", (existente["id"],))
+
         conn.commit()
     except Exception as e:
         logging.error(f"Erro salvar subsidios: {e}")
-    finally: cur.close(); conn.close()
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def _normalizar_subsidio(dado):
+    return {
+        "tipo": (dado.get("tipo") or "").strip(),
+        "item": (dado.get("item") or "").strip(),
+        "estado": (dado.get("estado") or "").strip(),
+        "data_limite": (dado.get("data_limite") or "").strip(),
+    }
+
+
+def _buscar_subsidio_existente(existentes, subsidio, usados):
+    for existente in existentes:
+        if existente["id"] in usados:
+            continue
+        if (
+            existente["tipo"] == subsidio["tipo"]
+            and existente["item"] == subsidio["item"]
+            and existente["data_limite"] == subsidio["data_limite"]
+        ):
+            return existente
+
+    for existente in existentes:
+        if existente["id"] in usados:
+            continue
+        if (
+            existente["tipo"] == subsidio["tipo"]
+            and existente["item"] == subsidio["item"]
+        ):
+            return existente
+
+    return None
 
 def recuperar_subsidios_anteriores(processo_id):
     """Retorna lista de dicionários com os subsídios atuais do banco para comparação."""
     conn = get_connection()
     if not conn: return []
     lista = []
+    cur = None
     try:
         cur = conn.cursor()
         cur.execute("SELECT tipo, item, estado, data_limite FROM subsidios WHERE processo_id = %s", (processo_id,))
@@ -208,9 +410,75 @@ def recuperar_subsidios_anteriores(processo_id):
                 "estado": r[2], 
                 "data_limite": r[3]
             })
-    except: pass
-    finally: cur.close(); conn.close()
+    except Exception as e:
+        logging.error(f"Erro ao recuperar subsídios do processo {processo_id}: {e}")
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
     return lista
+
+
+def buscar_processos_em_monitoramento():
+    conn = get_connection()
+    if not conn:
+        return []
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, cnj, npj
+            FROM processos
+            WHERE em_monitoramento = TRUE
+            ORDER BY data_atualizacao ASC, id ASC
+            """
+        )
+        return [
+            {"processo_id": row[0], "cnj": row[1], "npj": row[2]}
+            for row in cur.fetchall()
+        ]
+    except Exception as e:
+        logging.error(f"Erro ao buscar processos em monitoramento: {e}")
+        return []
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def buscar_processos_para_reconciliacao(*, limit=10, lookback_hours=168):
+    conn = get_connection()
+    if not conn:
+        return []
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, cnj, npj
+            FROM processos
+            WHERE COALESCE(em_monitoramento, FALSE) = FALSE
+              AND npj IS NOT NULL
+              AND data_atualizacao >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 hour')
+            ORDER BY data_atualizacao DESC, id DESC
+            LIMIT %s
+            """,
+            (lookback_hours, limit),
+        )
+        return [
+            {"processo_id": row[0], "cnj": row[1], "npj": row[2]}
+            for row in cur.fetchall()
+        ]
+    except Exception as e:
+        logging.error(f"Erro ao buscar processos para reconciliação: {e}")
+        return []
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
 
 
 def buscar_todos_solicitantes_por_cnj(cnj):
@@ -221,6 +489,7 @@ def buscar_todos_solicitantes_por_cnj(cnj):
     conn = get_connection()
     if not conn: return []
     lista_ids = []
+    cur = None
     try:
         cur = conn.cursor()
         # Seleciona IDs distintos para não notificar a mesma pessoa 2x se ela tiver 2 tarefas
@@ -236,6 +505,8 @@ def buscar_todos_solicitantes_por_cnj(cnj):
     except Exception as e:
         logging.error(f"Erro ao buscar solicitantes: {e}")
     finally: 
-        cur.close(); conn.close()
+        if cur:
+            cur.close()
+        conn.close()
     
     return lista_ids

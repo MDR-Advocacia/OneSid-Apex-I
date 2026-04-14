@@ -1,0 +1,445 @@
+import logging
+import os
+
+from selenium.common.exceptions import WebDriverException
+
+from bd import database
+
+from .exceptions import (
+    LoginError,
+    PortalElementNotFoundError,
+    PortalNavigationError,
+    PortalTimeoutError,
+    SessionExpiredError,
+    TemporaryPortalError,
+)
+from .rpa_runner import PortalRPARunner
+
+
+class MonitorRPARunner(PortalRPARunner):
+    def __init__(self, browser_factory=None, *, max_process_attempts=3, notifier=None):
+        super().__init__(browser_factory=browser_factory, max_task_attempts=max_process_attempts)
+        self.notifier = notifier
+        self.reconcile_enabled = self._env_flag("RPA_MONITOR_RECONCILE_ENABLED", True)
+        self.reconcile_limit = int(os.getenv("RPA_MONITOR_RECONCILE_LIMIT", "10"))
+        self.reconcile_lookback_hours = int(
+            os.getenv("RPA_MONITOR_RECONCILE_LOOKBACK_HOURS", "168")
+        )
+
+    def run_cycle(self):
+        logging.info("🔍 Buscando processos marcados para monitoramento.")
+        database.inicializar_banco()
+
+        processos_monitorados = database.buscar_processos_em_monitoramento()
+        candidatos_reconciliacao = self._buscar_candidatos_reconciliacao(
+            exclude_process_ids={processo["processo_id"] for processo in processos_monitorados}
+        )
+
+        if not processos_monitorados and not candidatos_reconciliacao:
+            logging.info("✅ Nenhum processo em monitoramento no momento.")
+            logging.info("🧩 Nenhum candidato recente para reconciliação de monitoramento.")
+            return
+
+        try:
+            self.ensure_browser()
+        except Exception as exc:
+            logging.error("❌ Não foi possível preparar o browser do monitor: %s", exc)
+            return
+
+        if not processos_monitorados:
+            logging.info("✅ Nenhum processo em monitoramento no momento.")
+        else:
+            logging.info("📋 Encontrados %s processos para verificar.", len(processos_monitorados))
+
+        notificacoes = []
+        for processo in processos_monitorados:
+            notificacoes.extend(self._processar_processo(processo))
+
+        self._reconciliar_falsos_negativos(candidatos_reconciliacao)
+
+        if notificacoes and self.notifier:
+            self.notifier(notificacoes)
+
+        logging.info("🏁 Ciclo de monitoramento finalizado.")
+
+    def _processar_processo(self, processo):
+        cnj = processo["cnj"]
+        npj = processo.get("npj")
+        logging.info("⚙️ Verificando processo: %s (NPJ: %s)", cnj, npj or "N/D")
+
+        try:
+            return self._processar_processo_com_retry(processo)
+        except Exception as exc:
+            logging.error("❌ Falha definitiva ao monitorar %s: %s", cnj, exc)
+            return []
+
+    def _processar_processo_com_retry(self, processo):
+        cnj = processo["cnj"]
+        last_error = None
+
+        for tentativa in range(1, self.max_task_attempts + 1):
+            try:
+                self.ensure_browser()
+                self.auth_service.ensure_authenticated()
+                return self._processar_processo_uma_vez(processo)
+            except SessionExpiredError as exc:
+                last_error = exc
+                logging.warning(
+                    "⚠️ Sessão expirada no monitor para %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.auth_service.ensure_authenticated(force_login=True)
+                    continue
+            except LoginError as exc:
+                last_error = exc
+                logging.error(
+                    "❌ Falha de login no monitor para %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.restart_browser("falha de login no monitor")
+                    continue
+            except (PortalTimeoutError, TemporaryPortalError, PortalNavigationError) as exc:
+                last_error = exc
+                logging.warning(
+                    "⏳ Erro temporário/navegação no monitor para %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self._recuperar_navegacao_monitorada(processo)
+                    continue
+            except PortalElementNotFoundError as exc:
+                last_error = exc
+                logging.warning(
+                    "🔎 Elemento não encontrado no monitor para %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self._reabrir_processo_monitorado(processo, preferir_fallback=True)
+                    continue
+            except WebDriverException as exc:
+                last_error = exc
+                logging.error(
+                    "🧨 Erro de WebDriver no monitor para %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.restart_browser("erro de webdriver no monitor")
+                    continue
+            except Exception as exc:
+                last_error = exc
+                logging.exception(
+                    "❌ Erro inesperado no monitor para %s na tentativa %s/%s.",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.restart_browser("erro inesperado no monitor")
+                    continue
+            break
+
+        raise last_error or RuntimeError("Falha ao monitorar processo sem erro identificado")
+
+    def _processar_processo_uma_vez(self, processo):
+        processo_id = processo["processo_id"]
+        cnj = processo["cnj"]
+        npj_atual = processo.get("npj")
+
+        subsidios_antigos = database.recuperar_subsidios_anteriores(processo_id)
+        npj_confirmado = self._reabrir_processo_monitorado(processo)
+
+        if npj_confirmado and npj_confirmado != npj_atual:
+            processo_id = database.salvar_processo(cnj, npj_confirmado) or processo_id
+            processo["npj"] = npj_confirmado
+            logging.info("🧭 NPJ do monitor atualizado para %s no processo %s.", npj_confirmado, cnj)
+
+        dados_novos = self.processo_service.coletar_lista_subsidios()
+        if not dados_novos:
+            logging.warning("⚠️ Tabela de subsídios vazia ou indisponível para %s.", cnj)
+            return []
+
+        notificacoes = self._montar_notificacoes(cnj, subsidios_antigos, dados_novos)
+        database.salvar_lista_subsidios(processo_id, dados_novos)
+
+        tem_pendencia = any(
+            item["estado"].upper() == "SOLICITADO"
+            for item in dados_novos
+            if item.get("estado")
+        )
+        if not tem_pendencia:
+            logging.info("🎉 Processo %s sem pendências. Desligando monitoramento.", cnj)
+            database.atualizar_status_monitoramento(processo_id, False)
+
+        return notificacoes
+
+    def _reabrir_processo_monitorado(self, processo, preferir_fallback=False):
+        cnj = processo["cnj"]
+        npj = processo.get("npj")
+
+        if npj and not preferir_fallback:
+            try:
+                logging.info("↪️ Abrindo processo monitorado diretamente pelo NPJ %s.", npj)
+                return self.processo_service.abrir_processo_por_npj(npj)
+            except (PortalElementNotFoundError, PortalNavigationError, PortalTimeoutError) as exc:
+                logging.warning(
+                    "⚠️ Abertura direta por NPJ falhou para %s. Caindo para consulta rápida. Motivo: %s",
+                    cnj,
+                    exc,
+                )
+
+        logging.info("↩️ Reabrindo processo monitorado pela consulta rápida do CNJ %s.", cnj)
+        self.processo_service.acessar_processo_consulta_rapida(cnj)
+        return self.processo_service.extrair_e_acessar_npj()
+
+    def _recuperar_navegacao_monitorada(self, processo):
+        try:
+            self.portal_client.refresh()
+            self.auth_service.ensure_authenticated()
+        except Exception as exc:
+            logging.warning("⚠️ Refresh não recuperou a navegação do monitor: %s", exc)
+
+        try:
+            self._reabrir_processo_monitorado(processo)
+        except Exception as exc:
+            logging.warning("⚠️ Reabertura do processo monitorado também falhou: %s", exc)
+            self.restart_browser("falha na recuperação de navegação do monitor")
+
+    def _reconciliar_falsos_negativos(self, candidatos):
+        if not candidatos:
+            return
+
+        logging.info(
+            "🧩 Reconciliando %s processos recentes fora do monitoramento.",
+            len(candidatos),
+        )
+
+        for processo in candidatos:
+            self._reconciliar_processo(processo)
+
+    def _buscar_candidatos_reconciliacao(self, *, exclude_process_ids):
+        if not self.reconcile_enabled:
+            return []
+
+        return [
+            processo
+            for processo in database.buscar_processos_para_reconciliacao(
+                limit=self.reconcile_limit,
+                lookback_hours=self.reconcile_lookback_hours,
+            )
+            if processo["processo_id"] not in exclude_process_ids
+        ]
+
+    def _reconciliar_processo(self, processo):
+        cnj = processo["cnj"]
+        logging.info("🧭 Reconciliando processo fora do monitoramento: %s", cnj)
+
+        try:
+            self._reconciliar_processo_com_retry(processo)
+        except Exception as exc:
+            logging.warning("⚠️ Não foi possível reconciliar %s nesta rodada: %s", cnj, exc)
+
+    def _reconciliar_processo_com_retry(self, processo):
+        cnj = processo["cnj"]
+        last_error = None
+
+        for tentativa in range(1, self.max_task_attempts + 1):
+            try:
+                self.ensure_browser()
+                self.auth_service.ensure_authenticated()
+                self._reconciliar_processo_uma_vez(processo)
+                return
+            except SessionExpiredError as exc:
+                last_error = exc
+                logging.warning(
+                    "⚠️ Sessão expirada na reconciliação de %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.auth_service.ensure_authenticated(force_login=True)
+                    continue
+            except LoginError as exc:
+                last_error = exc
+                logging.error(
+                    "❌ Falha de login na reconciliação de %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.restart_browser("falha de login na reconciliação")
+                    continue
+            except (PortalTimeoutError, TemporaryPortalError, PortalNavigationError) as exc:
+                last_error = exc
+                logging.warning(
+                    "⏳ Erro temporário/navegação na reconciliação de %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self._recuperar_navegacao_monitorada(processo)
+                    continue
+            except PortalElementNotFoundError as exc:
+                last_error = exc
+                logging.warning(
+                    "🔎 Elemento não encontrado na reconciliação de %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self._reabrir_processo_monitorado(processo, preferir_fallback=True)
+                    continue
+            except WebDriverException as exc:
+                last_error = exc
+                logging.error(
+                    "🧨 Erro de WebDriver na reconciliação de %s na tentativa %s/%s: %s",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                    exc,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.restart_browser("erro de webdriver na reconciliação")
+                    continue
+            except Exception as exc:
+                last_error = exc
+                logging.exception(
+                    "❌ Erro inesperado na reconciliação de %s na tentativa %s/%s.",
+                    cnj,
+                    tentativa,
+                    self.max_task_attempts,
+                )
+                if tentativa < self.max_task_attempts:
+                    self.restart_browser("erro inesperado na reconciliação")
+                    continue
+            break
+
+        raise last_error or RuntimeError("Falha ao reconciliar processo sem erro identificado")
+
+    def _reconciliar_processo_uma_vez(self, processo):
+        processo_id = processo["processo_id"]
+        cnj = processo["cnj"]
+        npj_atual = processo.get("npj")
+
+        npj_confirmado = self._reabrir_processo_monitorado(processo)
+        if npj_confirmado and npj_confirmado != npj_atual:
+            processo_id = database.salvar_processo(cnj, npj_confirmado) or processo_id
+            processo["npj"] = npj_confirmado
+            logging.info("🧭 NPJ reconciliado para %s no processo %s.", npj_confirmado, cnj)
+
+        dados_novos = self.processo_service.coletar_lista_subsidios()
+        if not dados_novos:
+            logging.warning("⚠️ Reconciliação sem subsídios legíveis para %s.", cnj)
+            return
+
+        database.salvar_lista_subsidios(processo_id, dados_novos)
+
+        tem_pendencia = any(
+            item["estado"].upper() == "SOLICITADO"
+            for item in dados_novos
+            if item.get("estado")
+        )
+
+        if tem_pendencia:
+            logging.info(
+                "🚨 Reconciliação detectou itens 'SOLICITADO' no processo %s. Reativando monitoramento.",
+                cnj,
+            )
+            database.atualizar_status_monitoramento(processo_id, True)
+
+    @staticmethod
+    def _montar_notificacoes(cnj, subsidios_antigos, dados_novos):
+        itens_alterados = []
+        for antigo in subsidios_antigos:
+            estado_antigo = (antigo.get("estado") or "").upper()
+            if estado_antigo != "SOLICITADO":
+                continue
+
+            correspondente_novo = next(
+                (
+                    item
+                    for item in dados_novos
+                    if item["item"] == antigo["item"]
+                    and item["tipo"] == antigo["tipo"]
+                    and item.get("data_limite") == antigo.get("data_limite")
+                ),
+                None,
+            )
+
+            if correspondente_novo and correspondente_novo["estado"].upper() != "SOLICITADO":
+                dt_info = (
+                    f" ({correspondente_novo.get('data_limite')})"
+                    if correspondente_novo.get("data_limite")
+                    else ""
+                )
+                itens_alterados.append(
+                    f"{correspondente_novo['tipo']} "
+                    f"{correspondente_novo['item']}{dt_info}: "
+                    f"{correspondente_novo['estado']}"
+                )
+
+        if not itens_alterados:
+            return []
+
+        lista_interessados = database.buscar_todos_solicitantes_por_cnj(cnj)
+        observacao_str = " | ".join(itens_alterados)
+
+        if not lista_interessados:
+            logging.warning(
+                "⚠️ Alteração detectada no %s, mas nenhum solicitante foi encontrado.",
+                cnj,
+            )
+            return []
+
+        logging.info(
+            "🔔 Notificando %s solicitantes sobre o processo %s.",
+            len(lista_interessados),
+            cnj,
+        )
+
+        notificacoes = []
+        for solicitante_id in lista_interessados:
+            try:
+                id_final = int(solicitante_id)
+            except (TypeError, ValueError):
+                id_final = 0
+
+            notificacoes.append(
+                {
+                    "numero_processo": cnj,
+                    "id_responsavel": id_final,
+                    "observacao": observacao_str,
+                }
+            )
+        return notificacoes
+
+    @staticmethod
+    def _env_flag(name, default=False):
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
