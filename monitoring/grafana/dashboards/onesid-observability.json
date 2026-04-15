@@ -78,7 +78,7 @@
             "uid": "onesid-loki"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({application=\"onesid-apex\",service=\"processador\"} |= \"❌\" [24h]))",
+          "expr": "sum(count_over_time({application=\"onesid-apex\",service=\"processador\",severity=\"error\"}[24h]))",
           "legendFormat": "Erros",
           "queryType": "range",
           "refId": "A"
@@ -143,7 +143,7 @@
             "uid": "onesid-loki"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({application=\"onesid-apex\",service=\"monitor\"} |= \"❌\" [24h]))",
+          "expr": "sum(count_over_time({application=\"onesid-apex\",service=\"monitor\",severity=\"error\"}[24h]))",
           "legendFormat": "Erros",
           "queryType": "range",
           "refId": "A"
@@ -208,7 +208,7 @@
             "uid": "onesid-loki"
           },
           "editorMode": "code",
-          "expr": "sum(count_over_time({application=\"onesid-apex\",service=\"coletor\"} |= \"❌\" [24h]))",
+          "expr": "sum(count_over_time({application=\"onesid-apex\",service=\"coletor\",severity=\"error\"}[24h]))",
           "legendFormat": "Erros",
           "queryType": "range",
           "refId": "A"
@@ -247,7 +247,7 @@
             "uid": "onesid-loki"
           },
           "editorMode": "code",
-          "expr": "{application=\"onesid-apex\"} |= \"❌\"",
+          "expr": "{application=\"onesid-apex\",severity=\"error\"}",
           "queryType": "range",
           "refId": "A"
         }
