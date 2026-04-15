@@ -9,6 +9,7 @@ from .browser_factory import BrowserFactory
 from .exceptions import (
     LoginError,
     PortalElementNotFoundError,
+    PortalNavigationError,
     PortalTimeoutError,
     SessionExpiredError,
     TemporaryPortalError,
@@ -124,7 +125,7 @@ class PortalRPARunner:
                 if tentativa < self.max_task_attempts:
                     self.restart_browser("falha de login")
                     continue
-            except (PortalTimeoutError, TemporaryPortalError) as exc:
+            except (PortalTimeoutError, TemporaryPortalError, PortalNavigationError) as exc:
                 last_error = exc
                 logging.warning(
                     "⏳ Erro temporário/timeout para o CNJ %s na tentativa %s/%s: %s",

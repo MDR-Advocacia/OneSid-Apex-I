@@ -21,15 +21,32 @@ BASE_URL = os.environ.get(
     "https://api.thomsonreuters.com/legalone/v1/api/rest",
 )
 REQUEST_TIMEOUT = int(os.getenv("LEGAL_ONE_REQUEST_TIMEOUT", "30"))
-PAGE_SIZE = int(os.getenv("LEGAL_ONE_PAGE_SIZE", "100"))
+API_TOP_LIMIT = 30
+PAGE_SIZE = min(int(os.getenv("LEGAL_ONE_PAGE_SIZE", "30")), API_TOP_LIMIT)
 MAX_PAGES_PER_TYPE = int(os.getenv("LEGAL_ONE_MAX_PAGES_PER_TYPE", "100"))
 
 TIPOS_TAREFA = [
     {"typeId": 30, "subTypeId": 1195},
     {"typeId": 28, "subTypeId": 961},
+    {"typeId": 28, "subTypeId": 936}, # Apresentar  Planilha - BB Autor
+    {"typeId": 26, "subTypeId": 1131}, # Solicitar  Monitoramento - ONESID
+    {"typeId": 15, "subTypeId": 856}, # Solicitar Subsídio / Tarefa - Luna 12/01
+    {"typeId": 13, "subTypeId": 843}, # Solicitar Subsídio / Tarefa - Luna 12/01
+    {"typeId": 28, "subTypeId": 984}, # Solicitar Preposto
+    {"typeId": 20, "subTypeId": 975}, # Obrigação de Fazer Complexa - Jonilson 28/01
+    {"typeId": 20, "subTypeId": 1139} # Obrigação de Fazer Simples  - Jonilson 28/01
 ]
 
 auth_token_cache = {"token": None, "expires_at": datetime.now(timezone.utc)}
+
+if PAGE_SIZE < 1:
+    PAGE_SIZE = API_TOP_LIMIT
+elif PAGE_SIZE > API_TOP_LIMIT:
+    logging.warning(
+        "⚠️ LEGAL_ONE_PAGE_SIZE acima do limite da API. Usando %s.",
+        API_TOP_LIMIT,
+    )
+    PAGE_SIZE = API_TOP_LIMIT
 
 
 def get_access_token():

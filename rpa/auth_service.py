@@ -17,6 +17,11 @@ class AuthService:
     )
     PORTAL_HOME_URL = "https://juridico.bb.com.br/paj/juridico/v2"
     LOGIN_URL_HINTS = ("loginweb.bb.com.br", "sso/xui")
+    ACCESS_ERROR_HINTS = (
+        "erro no acesso",
+        "identificador de segurança",
+        "id e o seu ip",
+    )
     LOGIN_FIELD_IDS = ("idToken1", "idToken3")
     USERNAME_LOCATOR = (By.ID, "idToken1")
     PASSWORD_LOCATOR = (By.ID, "idToken3")
@@ -51,6 +56,10 @@ class AuthService:
         try:
             self.driver.get(self.LOGIN_URL)
             self.wait_for_document_ready(timeout=self.timeout)
+            state = self._wait_for_login_stage_loaded(timeout=self.login_timeout)
+            if state == "authenticated":
+                logging.info("✅ Login já estava ativo ao abrir o SSO em %s", self.safe_current_url())
+                return True
 
             username_input = WebDriverWait(self.driver, self.login_timeout).until(
                 EC.visibility_of_element_located(self.USERNAME_LOCATOR)
@@ -84,6 +93,11 @@ class AuthService:
         logging.info("🔎 Validando sessão ativa no portal.")
         self.driver.get(self.PORTAL_HOME_URL)
         self.wait_for_document_ready(timeout=min(self.timeout, 20))
+        if self.is_access_error_page():
+            logging.warning(
+                "⚠️ Portal respondeu com página de erro de acesso durante a validação da sessão."
+            )
+            return False
         return self._looks_authenticated()
 
     def is_login_page(self):
@@ -115,6 +129,19 @@ class AuthService:
             return self.driver.current_url or ""
         except WebDriverException:
             return ""
+
+    def page_text(self):
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body")
+            return (body.text or "").strip()
+        except WebDriverException:
+            return ""
+
+    def is_access_error_page(self):
+        texto = self.page_text().lower()
+        if not texto:
+            return False
+        return all(hint in texto for hint in self.ACCESS_ERROR_HINTS)
 
     def _click_when_clickable(self, locator, description):
         WebDriverWait(self.driver, self.login_timeout).until(
@@ -234,6 +261,8 @@ class AuthService:
         current_url = self.safe_current_url().lower()
         if not current_url:
             return False
+        if self.is_access_error_page():
+            return False
         if any(fragment in current_url for fragment in self.LOGIN_URL_HINTS):
             return False
         if "juridico.bb.com.br" not in current_url:
@@ -280,6 +309,25 @@ class AuthService:
         except WebDriverException:
             return False
         return any(elemento.is_displayed() for elemento in elementos)
+
+    def _wait_for_login_stage_loaded(self, *, timeout):
+        def stage_ready(_driver):
+            if self.is_access_error_page():
+                return "access_error"
+            if self._looks_authenticated():
+                return "authenticated"
+            if self._username_stage_active() or self._password_stage_active():
+                return "login_stage"
+            return False
+
+        result = WebDriverWait(self.driver, timeout, poll_frequency=0.5).until(stage_ready)
+        if result == "access_error":
+            raise LoginError(
+                "Portal retornou página de erro de acesso durante o SSO",
+                current_url=self.safe_current_url(),
+                expected="tela de login renderizada ou sessão autenticada",
+            )
+        return result
 
     @staticmethod
     def _credentials_configured():

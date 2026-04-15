@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Onesid Dashboards
+    orgId: 1
+    folder: Onesid
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/dashboards

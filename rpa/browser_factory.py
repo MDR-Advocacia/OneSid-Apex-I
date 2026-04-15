@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -22,20 +23,33 @@ class BrowserFactory:
         self.version_main = self._resolve_version_main()
         self.profile_dir = os.getenv("RPA_CHROME_PROFILE_DIR")
         self.headless = _env_flag("RPA_HEADLESS", False)
+        self.no_sandbox = _env_flag("RPA_CHROME_NO_SANDBOX", False)
+        self.disable_gpu = _env_flag("RPA_CHROME_DISABLE_GPU", False)
         self.page_load_timeout = int(os.getenv("RPA_PAGE_LOAD_TIMEOUT", "60"))
-        self.cache_dir = Path(os.getenv("APPDATA", "")) / "undetected_chromedriver"
+        appdata = os.getenv("APPDATA")
+        if appdata:
+            self.cache_dir = Path(appdata) / "undetected_chromedriver"
+        else:
+            self.cache_dir = Path.home() / ".local" / "share" / "undetected_chromedriver"
         self.temp_profile_prefix = "onesid-rpa-chrome-"
         self._cleanup_stale_temp_profiles()
 
     def build_options(self):
         options = uc.ChromeOptions()
-        options.add_argument("--start-maximized")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-first-run")
         options.add_argument("--no-default-browser-check")
 
         if self.headless:
             options.add_argument("--headless=new")
+            options.add_argument("--window-size=1920,1080")
+            options.add_argument("--remote-debugging-port=9222")
+        else:
+            options.add_argument("--start-maximized")
+        if self.no_sandbox:
+            options.add_argument("--no-sandbox")
+        if self.disable_gpu:
+            options.add_argument("--disable-gpu")
 
         return options
 
@@ -67,6 +81,28 @@ class BrowserFactory:
                     "Falha ao inicializar o navegador"
                 ) from retry_exc
         except Exception as exc:
+            if persistent_profile:
+                logging.warning(
+                    "⚠️ Falha ao abrir o Chrome com o perfil persistente em %s. Tentando perfil temporário.",
+                    profile_path,
+                )
+                temp_profile_path = Path(tempfile.mkdtemp(prefix=self.temp_profile_prefix))
+                temp_options = self.build_options()
+                try:
+                    return self._start_chrome(
+                        temp_options,
+                        user_data_dir=temp_profile_path,
+                        persistent_profile=False,
+                    )
+                except Exception as retry_exc:
+                    logging.exception(
+                        "Falha ao inicializar o navegador após fallback para perfil temporário."
+                    )
+                    self._cleanup_profile_dir(temp_profile_path, False)
+                    raise BrowserInitializationError(
+                        "Falha ao inicializar o navegador"
+                    ) from retry_exc
+
             logging.exception("Falha ao inicializar o navegador com Chrome major %s.", self.version_main)
             self._cleanup_profile_dir(profile_path, persistent_profile)
             raise BrowserInitializationError("Falha ao inicializar o navegador") from exc
@@ -127,6 +163,37 @@ class BrowserFactory:
 
     @staticmethod
     def _detect_installed_chrome_major():
+        if os.name != "nt":
+            for chrome_command in (
+                "google-chrome",
+                "google-chrome-stable",
+                "chromium",
+                "chromium-browser",
+            ):
+                command_path = shutil.which(chrome_command)
+                if not command_path:
+                    continue
+
+                try:
+                    completed = subprocess.run(
+                        [command_path, "--version"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                except Exception:
+                    continue
+
+                version_tokens = completed.stdout.strip().split()
+                if not version_tokens:
+                    continue
+
+                version = version_tokens[-1]
+                if version and version[0].isdigit():
+                    return int(version.split(".", 1)[0])
+
+            return None
+
         possible_paths = [
             Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
             Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
@@ -160,8 +227,6 @@ class BrowserFactory:
             except Exception:
                 pass
             try:
-                import subprocess
-
                 completed = subprocess.run(
                     [
                         "powershell",

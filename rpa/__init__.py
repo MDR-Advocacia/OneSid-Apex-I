@@ -3,6 +3,7 @@ from .browser_factory import BrowserFactory
 from .exceptions import (
     BrowserInitializationError,
     LoginError,
+    PortalAccessError,
     PortalElementNotFoundError,
     PortalNavigationError,
     PortalTimeoutError,
@@ -21,6 +22,7 @@ __all__ = [
     "BrowserInitializationError",
     "LoginError",
     "MonitorRPARunner",
+    "PortalAccessError",
     "PortalClient",
     "PortalElementNotFoundError",
     "PortalNavigationError",

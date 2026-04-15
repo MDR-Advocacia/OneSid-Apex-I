@@ -11,6 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
 from .exceptions import (
+    PortalAccessError,
     PortalElementNotFoundError,
     PortalNavigationError,
     PortalTimeoutError,
@@ -48,6 +49,7 @@ class PortalClient:
 
         self.wait_for_document_ready(timeout=timeout)
         self.raise_if_login_redirect(expected=f"manter sessão ativa em {description}")
+        self.raise_if_access_error(expected=f"acesso liberado para {description}")
 
         if expected_url_fragment:
             try:
@@ -78,11 +80,20 @@ class PortalClient:
             ) from exc
         self.wait_for_document_ready(timeout=min(self.timeout, 20))
         self.raise_if_login_redirect(expected="sessão válida após refresh")
+        self.raise_if_access_error(expected="acesso liberado após refresh")
 
     def raise_if_login_redirect(self, *, expected=None):
         if self.auth_service.is_login_page():
             raise SessionExpiredError(
                 "Portal redirecionou para login",
+                current_url=self.safe_current_url(),
+                expected=expected,
+            )
+
+    def raise_if_access_error(self, *, expected=None):
+        if self.auth_service.is_access_error_page():
+            raise PortalAccessError(
+                "Portal retornou página de erro de acesso",
                 current_url=self.safe_current_url(),
                 expected=expected,
             )
@@ -121,6 +132,7 @@ class PortalClient:
             ).until(locate)
         except TimeoutException as exc:
             self.raise_if_login_redirect(expected=description)
+            self.raise_if_access_error(expected=description)
             raise PortalElementNotFoundError(
                 f"Elemento não localizado: {description}",
                 current_url=self.safe_current_url(),

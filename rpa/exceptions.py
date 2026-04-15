@@ -37,5 +37,9 @@ class PortalNavigationError(RPAError):
     pass
 
 
+class PortalAccessError(PortalNavigationError):
+    pass
+
+
 class TemporaryPortalError(RPAError):
     pass
