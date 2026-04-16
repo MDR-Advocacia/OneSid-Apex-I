@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -24,6 +25,22 @@ REQUEST_TIMEOUT = int(os.getenv("LEGAL_ONE_REQUEST_TIMEOUT", "30"))
 API_TOP_LIMIT = 30
 PAGE_SIZE = min(int(os.getenv("LEGAL_ONE_PAGE_SIZE", "30")), API_TOP_LIMIT)
 MAX_PAGES_PER_TYPE = int(os.getenv("LEGAL_ONE_MAX_PAGES_PER_TYPE", "100"))
+REQUESTS_PER_MINUTE = max(1, int(os.getenv("LEGAL_ONE_REQUESTS_PER_MINUTE", "45")))
+REQUEST_RETRIES = max(1, int(os.getenv("LEGAL_ONE_REQUEST_RETRIES", "3")))
+MIN_REQUEST_INTERVAL_SECONDS = float(
+    os.getenv(
+        "LEGAL_ONE_MIN_REQUEST_INTERVAL_SECONDS",
+        str(60 / REQUESTS_PER_MINUTE),
+    )
+)
+RATE_LIMIT_BACKOFF_SECONDS = max(
+    1.0,
+    float(os.getenv("LEGAL_ONE_RATE_LIMIT_BACKOFF_SECONDS", "65")),
+)
+RETRY_BACKOFF_SECONDS = max(
+    0.0,
+    float(os.getenv("LEGAL_ONE_RETRY_BACKOFF_SECONDS", "5")),
+)
 
 TIPOS_TAREFA = [
     {"typeId": 30, "subTypeId": 1195},
@@ -38,6 +55,7 @@ TIPOS_TAREFA = [
 ]
 
 auth_token_cache = {"token": None, "expires_at": datetime.now(timezone.utc)}
+last_request_at = 0.0
 
 if PAGE_SIZE < 1:
     PAGE_SIZE = API_TOP_LIMIT
@@ -72,15 +90,91 @@ def get_access_token():
 
 
 def make_api_request(url, params=None):
-    token = get_access_token()
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params=params or {},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
+    last_error = None
+
+    for tentativa in range(1, REQUEST_RETRIES + 1):
+        token = get_access_token()
+        _aguardar_cadencia_legal_one()
+
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                params=params or {},
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 429:
+                espera = _calcular_espera_rate_limit(response)
+                last_error = f"429 Too Many Requests: {response.text[:300]}"
+                logging.warning(
+                    "⏳ [APEX] Legal One limitou requisições (429). Aguardando %.1fs antes de tentar novamente (%s/%s).",
+                    espera,
+                    tentativa,
+                    REQUEST_RETRIES,
+                )
+                if tentativa < REQUEST_RETRIES:
+                    time.sleep(espera)
+                    continue
+
+            if response.status_code >= 500 and tentativa < REQUEST_RETRIES:
+                espera = RETRY_BACKOFF_SECONDS * tentativa
+                last_error = f"status={response.status_code} body={response.text[:300]}"
+                logging.warning(
+                    "⏳ [APEX] Erro temporário Legal One (%s). Nova tentativa em %.1fs (%s/%s).",
+                    response.status_code,
+                    espera,
+                    tentativa,
+                    REQUEST_RETRIES,
+                )
+                if espera > 0:
+                    time.sleep(espera)
+                continue
+
+            response.raise_for_status()
+            return response.json()
+        except RequestException as exc:
+            last_error = exc
+            if tentativa >= REQUEST_RETRIES:
+                raise
+
+            espera = RETRY_BACKOFF_SECONDS * tentativa
+            logging.warning(
+                "⏳ [APEX] Falha temporária na API Legal One. Nova tentativa em %.1fs (%s/%s): %s",
+                espera,
+                tentativa,
+                REQUEST_RETRIES,
+                exc,
+            )
+            if espera > 0:
+                time.sleep(espera)
+
+    raise RequestException(last_error or "Falha ao consultar API Legal One")
+
+
+def _aguardar_cadencia_legal_one():
+    global last_request_at
+
+    if MIN_REQUEST_INTERVAL_SECONDS <= 0:
+        return
+
+    agora = time.monotonic()
+    espera = MIN_REQUEST_INTERVAL_SECONDS - (agora - last_request_at)
+    if espera > 0:
+        time.sleep(espera)
+
+    last_request_at = time.monotonic()
+
+
+def _calcular_espera_rate_limit(response):
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(1.0, float(retry_after))
+        except ValueError:
+            pass
+
+    return RATE_LIMIT_BACKOFF_SECONDS
 
 
 def buscar_e_abastecer_fila():
@@ -263,6 +357,11 @@ def _buscar_pagina_tarefas(type_id, sub_type_id, *, before_id=None):
 def _processar_tarefa(task, litigation_cache):
     task_id = task.get("id")
     solicitante_id = task.get("finishedBy")
+
+    if task_id and database.tarefa_ja_na_fila(task_id):
+        logging.info("↺ [APEX] Tarefa %s já existia na fila. Seguindo coleta.", task_id)
+        return "duplicate"
+
     litigation_id = _extrair_litigation_id(task.get("relationships", []))
 
     if not litigation_id:

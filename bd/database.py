@@ -11,6 +11,7 @@ DB_NAME = os.getenv("DB_NAME", "onesid_db")
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "postgres")
 DB_PORT = os.getenv("DB_PORT", "5432")
+SCHEMA_INIT_LOCK_ID = 6012026041501
 
 def get_connection():
     try:
@@ -21,12 +22,21 @@ def get_connection():
         logging.error(f"❌ Erro conexão BD: {e}")
         return None
 
+
+def _adquirir_lock_inicializacao(cur):
+    """
+    Serializa o bootstrap do schema para evitar corrida entre containers
+    subindo ao mesmo tempo.
+    """
+    cur.execute("SELECT pg_advisory_xact_lock(%s);", (SCHEMA_INIT_LOCK_ID,))
+
 def inicializar_banco():
     conn = get_connection()
     if not conn: return
     cur = None
     try:
         cur = conn.cursor()
+        _adquirir_lock_inicializacao(cur)
         
         # Tabela Processos
         cur.execute("""
@@ -143,6 +153,27 @@ def inserir_tarefa_na_fila(tarefa_id, cnj, solicitante_id):
     except Exception as e:
         logging.error(f"Erro ao inserir tarefa {tarefa_id} na fila: {e}")
         return None
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def tarefa_ja_na_fila(tarefa_id):
+    conn = get_connection()
+    if not conn:
+        return False
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT 1 FROM tarefas_legal_one WHERE tarefa_id = %s LIMIT 1",
+            (tarefa_id,),
+        )
+        return cur.fetchone() is not None
+    except Exception as e:
+        logging.error(f"Erro ao verificar tarefa {tarefa_id} na fila: {e}")
+        return False
     finally:
         if cur:
             cur.close()
