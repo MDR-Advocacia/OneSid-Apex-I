@@ -1,5 +1,6 @@
 import os
 import logging
+import hashlib
 import psycopg2
 from dotenv import load_dotenv
 
@@ -90,6 +91,27 @@ def inicializar_banco():
                 atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (type_id, sub_type_id)
             );
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS twotask_notificacoes (
+                id SERIAL PRIMARY KEY,
+                dedupe_key VARCHAR(64) UNIQUE NOT NULL,
+                numero_processo VARCHAR(50) NOT NULL,
+                id_responsavel BIGINT,
+                observacao TEXT NOT NULL,
+                status VARCHAR(20) DEFAULT 'ENVIANDO',
+                tentativas INTEGER DEFAULT 0,
+                ultimo_erro TEXT,
+                data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                data_envio TIMESTAMP,
+                data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_twotask_notificacoes_status
+            ON twotask_notificacoes (status, data_atualizacao);
         """)
         
         conn.commit()
@@ -510,3 +532,162 @@ def buscar_todos_solicitantes_por_cnj(cnj):
         conn.close()
     
     return lista_ids
+
+
+def registrar_notificacoes_twotask(lista_notificacoes):
+    """
+    Registra notificações antes do POST para impedir envio duplicado em ciclos
+    paralelos ou reexecuções próximas do monitor.
+    """
+    if not lista_notificacoes:
+        return []
+
+    conn = get_connection()
+    if not conn:
+        logging.error("❌ Não foi possível registrar notificações TwoTask para deduplicação.")
+        return []
+
+    notificacoes_para_envio = []
+    cur = None
+
+    try:
+        cur = conn.cursor()
+        for notificacao in lista_notificacoes:
+            normalizada = _normalizar_notificacao_twotask(notificacao)
+            if not normalizada:
+                continue
+
+            dedupe_key = _gerar_dedupe_key_notificacao(normalizada)
+            cur.execute(
+                """
+                INSERT INTO twotask_notificacoes (
+                    dedupe_key,
+                    numero_processo,
+                    id_responsavel,
+                    observacao,
+                    status,
+                    data_atualizacao
+                )
+                VALUES (%s, %s, %s, %s, 'ENVIANDO', CURRENT_TIMESTAMP)
+                ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    dedupe_key,
+                    normalizada["numero_processo"],
+                    normalizada["id_responsavel"],
+                    normalizada["observacao"],
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                logging.info(
+                    "🧯 Notificação TwoTask duplicada bloqueada localmente: processo=%s responsável=%s",
+                    normalizada["numero_processo"],
+                    normalizada["id_responsavel"],
+                )
+                continue
+
+            normalizada["_dedupe_key"] = dedupe_key
+            normalizada["_notificacao_id"] = row[0]
+            notificacoes_para_envio.append(normalizada)
+
+        conn.commit()
+        return notificacoes_para_envio
+    except Exception as e:
+        conn.rollback()
+        logging.error("❌ Erro ao registrar notificações TwoTask: %s", e)
+        return []
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def marcar_notificacoes_twotask_enviadas(dedupe_keys):
+    _atualizar_status_notificacoes_twotask(
+        dedupe_keys,
+        status="ENVIADO",
+        ultimo_erro=None,
+        marcar_envio=True,
+    )
+
+
+def marcar_notificacoes_twotask_erro(dedupe_keys, erro):
+    _atualizar_status_notificacoes_twotask(
+        dedupe_keys,
+        status="ERRO",
+        ultimo_erro=(erro or "Falha desconhecida")[:1000],
+        marcar_envio=False,
+    )
+
+
+def _atualizar_status_notificacoes_twotask(
+    dedupe_keys,
+    *,
+    status,
+    ultimo_erro,
+    marcar_envio,
+):
+    if not dedupe_keys:
+        return
+
+    conn = get_connection()
+    if not conn:
+        logging.error("❌ Não foi possível atualizar status das notificações TwoTask.")
+        return
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE twotask_notificacoes
+            SET status = %s,
+                tentativas = COALESCE(tentativas, 0) + 1,
+                ultimo_erro = %s,
+                data_envio = CASE WHEN %s THEN CURRENT_TIMESTAMP ELSE data_envio END,
+                data_atualizacao = CURRENT_TIMESTAMP
+            WHERE dedupe_key = ANY(%s)
+            """,
+            (status, ultimo_erro, marcar_envio, list(dedupe_keys)),
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error("❌ Erro ao atualizar notificações TwoTask: %s", e)
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def _normalizar_notificacao_twotask(notificacao):
+    numero_processo = (notificacao.get("numero_processo") or "").strip()
+    observacao = " ".join((notificacao.get("observacao") or "").split())
+
+    if not numero_processo or not observacao:
+        logging.warning("⚠️ Notificação TwoTask incompleta ignorada: %s", notificacao)
+        return None
+
+    try:
+        id_responsavel = int(notificacao.get("id_responsavel") or 0)
+    except (TypeError, ValueError):
+        id_responsavel = 0
+
+    return {
+        "numero_processo": numero_processo,
+        "id_responsavel": id_responsavel,
+        "observacao": observacao,
+    }
+
+
+def _gerar_dedupe_key_notificacao(notificacao):
+    base = "|".join(
+        [
+            notificacao["numero_processo"],
+            str(notificacao["id_responsavel"]),
+            notificacao["observacao"],
+        ]
+    )
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()

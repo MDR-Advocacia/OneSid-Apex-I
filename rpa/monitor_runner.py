@@ -58,7 +58,7 @@ class MonitorRPARunner(PortalRPARunner):
         self._reconciliar_falsos_negativos(candidatos_reconciliacao)
 
         if notificacoes and self.notifier:
-            self.notifier(notificacoes)
+            self._enviar_notificacoes(notificacoes)
 
         logging.info("🏁 Ciclo de monitoramento finalizado.")
 
@@ -371,6 +371,42 @@ class MonitorRPARunner(PortalRPARunner):
             )
             database.atualizar_status_monitoramento(processo_id, True)
 
+    def _enviar_notificacoes(self, notificacoes):
+        notificacoes_registradas = database.registrar_notificacoes_twotask(notificacoes)
+        if not notificacoes_registradas:
+            logging.info("🧯 Nenhuma notificação nova para enviar ao TwoTask após deduplicação.")
+            return
+
+        dedupe_keys = [item["_dedupe_key"] for item in notificacoes_registradas]
+        payload = [
+            {
+                "numero_processo": item["numero_processo"],
+                "id_responsavel": item["id_responsavel"],
+                "observacao": item["observacao"],
+            }
+            for item in notificacoes_registradas
+        ]
+        batch_key = self._batch_dedupe_key(dedupe_keys)
+
+        try:
+            try:
+                enviado = self.notifier(payload, idempotency_key=batch_key)
+            except TypeError:
+                enviado = self.notifier(payload)
+        except Exception as exc:
+            logging.exception("❌ Erro inesperado ao enviar notificações para o TwoTask.")
+            database.marcar_notificacoes_twotask_erro(dedupe_keys, str(exc))
+            return
+
+        if enviado:
+            database.marcar_notificacoes_twotask_enviadas(dedupe_keys)
+            return
+
+        database.marcar_notificacoes_twotask_erro(
+            dedupe_keys,
+            "API TwoTask retornou falha no envio do lote",
+        )
+
     @staticmethod
     def _montar_notificacoes(cnj, subsidios_antigos, dados_novos):
         itens_alterados = []
@@ -443,3 +479,10 @@ class MonitorRPARunner(PortalRPARunner):
         if value is None:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _batch_dedupe_key(dedupe_keys):
+        import hashlib
+
+        material = "|".join(sorted(dedupe_keys))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
