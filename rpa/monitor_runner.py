@@ -25,6 +25,15 @@ class MonitorRPARunner(PortalRPARunner):
         self.reconcile_lookback_hours = int(
             os.getenv("RPA_MONITOR_RECONCILE_LOOKBACK_HOURS", "168")
         )
+        self.notification_retry_batch_limit = int(
+            os.getenv("API_NOTIFICACAO_RETRY_LIMIT", "10")
+        )
+        self.notification_max_attempts = int(
+            os.getenv("API_NOTIFICACAO_MAX_TENTATIVAS", "5")
+        )
+        self.notification_retry_sending_after_minutes = int(
+            os.getenv("API_NOTIFICACAO_RETRY_ENVIANDO_MINUTES", "10")
+        )
 
     def run_cycle(self):
         logging.info("🔍 Buscando processos marcados para monitoramento.")
@@ -38,6 +47,8 @@ class MonitorRPARunner(PortalRPARunner):
         if not processos_monitorados and not candidatos_reconciliacao:
             logging.info("✅ Nenhum processo em monitoramento no momento.")
             logging.info("🧩 Nenhum candidato recente para reconciliação de monitoramento.")
+            if self.notifier:
+                self._reenviar_notificacoes_pendentes()
             return
 
         try:
@@ -59,6 +70,9 @@ class MonitorRPARunner(PortalRPARunner):
 
         if notificacoes and self.notifier:
             self._enviar_notificacoes(notificacoes)
+
+        if self.notifier:
+            self._reenviar_notificacoes_pendentes()
 
         logging.info("🏁 Ciclo de monitoramento finalizado.")
 
@@ -173,6 +187,7 @@ class MonitorRPARunner(PortalRPARunner):
         dados_novos = self.processo_service.coletar_lista_subsidios()
         if not dados_novos:
             logging.warning("⚠️ Tabela de subsídios vazia ou indisponível para %s.", cnj)
+            database.marcar_processo_verificado(processo_id)
             return []
 
         notificacoes = self._montar_notificacoes(cnj, subsidios_antigos, dados_novos)
@@ -354,6 +369,7 @@ class MonitorRPARunner(PortalRPARunner):
         dados_novos = self.processo_service.coletar_lista_subsidios()
         if not dados_novos:
             logging.warning("⚠️ Reconciliação sem subsídios legíveis para %s.", cnj)
+            database.marcar_processo_verificado(processo_id)
             return
 
         database.salvar_lista_subsidios(processo_id, dados_novos)
@@ -377,6 +393,29 @@ class MonitorRPARunner(PortalRPARunner):
             logging.info("🧯 Nenhuma notificação nova para enviar ao TwoTask após deduplicação.")
             return
 
+        self._postar_notificacoes_registradas(notificacoes_registradas)
+
+    def _reenviar_notificacoes_pendentes(self):
+        notificacoes = database.buscar_lotes_notificacoes_twotask_para_reenvio(
+            limite_lotes=self.notification_retry_batch_limit,
+            max_tentativas=self.notification_max_attempts,
+            reenviar_enviando_apos_minutos=self.notification_retry_sending_after_minutes,
+        )
+        if not notificacoes:
+            return
+
+        lotes = {}
+        for notificacao in notificacoes:
+            lotes.setdefault(notificacao["_batch_ref"], []).append(notificacao)
+
+        logging.info(
+            "🔁 Reenviando %s lote(s) de aviso de retorno de subsídio pendentes.",
+            len(lotes),
+        )
+        for lote in lotes.values():
+            self._postar_notificacoes_registradas(lote)
+
+    def _postar_notificacoes_registradas(self, notificacoes_registradas):
         dedupe_keys = [item["_dedupe_key"] for item in notificacoes_registradas]
         payload = [
             {

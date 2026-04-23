@@ -82,6 +82,10 @@ class PortalRPARunner:
         cnj = tarefa["processo_cnj"]
         tarefa_id = tarefa["tarefa_id"]
 
+        if not database.tarefa_esta_aberta(tarefa_id):
+            logging.info("↺ Tarefa %s não está mais aberta. Pulando CNJ %s.", tarefa_id, cnj)
+            return
+
         logging.info("⚙️ Processando CNJ: %s", cnj)
 
         try:
@@ -89,7 +93,7 @@ class PortalRPARunner:
             database.marcar_tarefa_concluida(tarefa_id, "CONCLUIDO")
         except Exception as exc:
             logging.error("❌ Falha definitiva no CNJ %s: %s", cnj, exc)
-            database.marcar_tarefa_concluida(tarefa_id, "ERRO")
+            database.marcar_tarefa_concluida(tarefa_id, "ERRO", str(exc))
 
     def _processar_tarefa_com_retry(self, tarefa):
         cnj = tarefa["processo_cnj"]

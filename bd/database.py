@@ -12,6 +12,10 @@ DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "postgres")
 DB_PORT = os.getenv("DB_PORT", "5432")
 SCHEMA_INIT_LOCK_ID = 6012026041501
+TASK_ERROR_RETRY_BACKOFF_MINUTES = int(os.getenv("RPA_TASK_ERROR_RETRY_BACKOFF_MINUTES", "120"))
+TASK_MAX_ERROR_RETRIES = int(os.getenv("RPA_TASK_MAX_ERROR_RETRIES", "3"))
+TASK_OPEN_STATUSES = ("PENDENTE", "ERRO")
+TASK_DUPLICATE_STATUS = "DUPLICADO"
 
 def get_connection():
     try:
@@ -93,6 +97,43 @@ def inicializar_banco():
             );
         """)
 
+        cur.execute("ALTER TABLE tarefas_legal_one ADD COLUMN IF NOT EXISTS tentativas INTEGER DEFAULT 0;")
+        cur.execute("ALTER TABLE tarefas_legal_one ADD COLUMN IF NOT EXISTS ultimo_erro TEXT;")
+        cur.execute("ALTER TABLE tarefas_legal_one ADD COLUMN IF NOT EXISTS ultima_tentativa TIMESTAMP;")
+
+        cur.execute("""
+            WITH ranked AS (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(processo_cnj, ''), COALESCE(solicitante_id, '')
+                        ORDER BY
+                            CASE WHEN status = 'PENDENTE' THEN 0 ELSE 1 END,
+                            data_criacao ASC,
+                            id ASC
+                    ) AS ordem
+                FROM tarefas_legal_one
+                WHERE status IN ('PENDENTE', 'ERRO')
+            )
+            UPDATE tarefas_legal_one t
+            SET status = 'DUPLICADO',
+                data_conclusao = COALESCE(t.data_conclusao, CURRENT_TIMESTAMP),
+                ultima_tentativa = CURRENT_TIMESTAMP,
+                ultimo_erro = 'Ignorada por duplicidade aberta do mesmo CNJ/solicitante.'
+            FROM ranked r
+            WHERE t.id = r.id
+              AND r.ordem > 1;
+        """)
+
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tarefas_legal_one_aberta_cnj_solicitante
+            ON tarefas_legal_one (
+                COALESCE(processo_cnj, ''),
+                COALESCE(solicitante_id, '')
+            )
+            WHERE status IN ('PENDENTE', 'ERRO');
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS coleta_legalone_cursor (
                 type_id BIGINT NOT NULL,
@@ -141,12 +182,24 @@ def inserir_tarefa_na_fila(tarefa_id, cnj, solicitante_id):
     if not conn: return False
     cur = None
     try:
+        solicitante_id_normalizado = str(solicitante_id) if solicitante_id is not None else None
         cur = conn.cursor()
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s));",
+            (f"{cnj}|{solicitante_id_normalizado or ''}",),
+        )
         cur.execute("""
             INSERT INTO tarefas_legal_one (tarefa_id, processo_cnj, solicitante_id, status)
-            VALUES (%s, %s, %s, 'PENDENTE')
+            SELECT %s, %s, %s, 'PENDENTE'
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM tarefas_legal_one
+                WHERE COALESCE(processo_cnj, '') = COALESCE(%s, '')
+                  AND COALESCE(solicitante_id, '') = COALESCE(%s::text, '')
+                  AND status IN ('PENDENTE', 'ERRO')
+            )
             ON CONFLICT (tarefa_id) DO NOTHING;
-        """, (tarefa_id, cnj, solicitante_id))
+        """, (tarefa_id, cnj, solicitante_id_normalizado, cnj, solicitante_id_normalizado))
         rows = cur.rowcount
         conn.commit()
         return True if rows > 0 else False
@@ -179,6 +232,29 @@ def tarefa_ja_na_fila(tarefa_id):
             cur.close()
         conn.close()
 
+
+def tarefa_esta_aberta(tarefa_id):
+    conn = get_connection()
+    if not conn:
+        return False
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT status FROM tarefas_legal_one WHERE tarefa_id = %s",
+            (tarefa_id,),
+        )
+        row = cur.fetchone()
+        return bool(row and row[0] in TASK_OPEN_STATUSES)
+    except Exception as e:
+        logging.error(f"Erro ao verificar status da tarefa {tarefa_id}: {e}")
+        return False
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
 def buscar_tarefas_pendentes():
     conn = get_connection()
     if not conn: return []
@@ -188,9 +264,19 @@ def buscar_tarefas_pendentes():
         cur.execute("""
             SELECT tarefa_id, processo_cnj, solicitante_id 
             FROM tarefas_legal_one 
-            WHERE status IN ('PENDENTE', 'ERRO')
-            ORDER BY data_criacao ASC
-        """)
+            WHERE status = 'PENDENTE'
+               OR (
+                    status = 'ERRO'
+                    AND COALESCE(tentativas, 0) < %s
+                    AND (
+                        ultima_tentativa IS NULL
+                        OR ultima_tentativa <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+                    )
+               )
+            ORDER BY
+                CASE WHEN status = 'PENDENTE' THEN 0 ELSE 1 END,
+                data_criacao ASC
+        """, (TASK_MAX_ERROR_RETRIES, TASK_ERROR_RETRY_BACKOFF_MINUTES))
         return [{"tarefa_id": r[0], "processo_cnj": r[1], "solicitante_id": r[2]} for r in cur.fetchall()]
     except Exception as e:
         logging.error(f"Erro ao buscar tarefas pendentes: {e}")
@@ -266,7 +352,7 @@ def atualizar_cursor_coleta(type_id, sub_type_id, ultimo_task_id):
             cur.close()
         conn.close()
 
-def marcar_tarefa_concluida(tarefa_id, status_final='CONCLUIDO'):
+def marcar_tarefa_concluida(tarefa_id, status_final='CONCLUIDO', erro=None):
     conn = get_connection()
     if not conn: return
     cur = None
@@ -274,9 +360,19 @@ def marcar_tarefa_concluida(tarefa_id, status_final='CONCLUIDO'):
         cur = conn.cursor()
         cur.execute("""
             UPDATE tarefas_legal_one 
-            SET status = %s, data_conclusao = CURRENT_TIMESTAMP
+            SET status = %s,
+                data_conclusao = CASE WHEN %s = 'CONCLUIDO' THEN CURRENT_TIMESTAMP ELSE data_conclusao END,
+                ultima_tentativa = CURRENT_TIMESTAMP,
+                tentativas = CASE
+                    WHEN %s = 'ERRO' THEN COALESCE(tentativas, 0) + 1
+                    ELSE COALESCE(tentativas, 0)
+                END,
+                ultimo_erro = CASE
+                    WHEN %s = 'ERRO' THEN %s
+                    ELSE NULL
+                END
             WHERE tarefa_id = %s
-        """, (status_final, tarefa_id))
+        """, (status_final, status_final, status_final, status_final, (erro or "")[:1000], tarefa_id))
         conn.commit()
     except Exception as e:
         logging.error(f"Erro ao atualizar status da tarefa {tarefa_id}: {e}")
@@ -320,12 +416,44 @@ def atualizar_status_monitoramento(processo_id, ativar=True):
     cur = None
     try:
         cur = conn.cursor()
-        cur.execute("UPDATE processos SET em_monitoramento = %s WHERE id = %s", (ativar, processo_id))
+        cur.execute(
+            """
+            UPDATE processos
+            SET em_monitoramento = %s,
+                data_atualizacao = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (ativar, processo_id),
+        )
         conn.commit()
         status_str = "ATIVADO" if ativar else "DESATIVADO"
         logging.info(f"👀 Monitoramento {status_str} para processo ID {processo_id}.")
     except Exception as e:
         logging.error(f"❌ Erro atualizar monitoramento: {e}")
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def marcar_processo_verificado(processo_id):
+    conn = get_connection()
+    if not conn:
+        return
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE processos
+            SET data_atualizacao = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (processo_id,),
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Erro ao marcar processo {processo_id} como verificado: {e}")
     finally:
         if cur:
             cur.close()
@@ -405,6 +533,15 @@ def salvar_lista_subsidios(processo_id, lista_dados):
             if existente["id"] in preservados:
                 continue
             cur.execute("DELETE FROM subsidios WHERE id = %s", (existente["id"],))
+
+        cur.execute(
+            """
+            UPDATE processos
+            SET data_atualizacao = CURRENT_TIMESTAMP
+            WHERE id = %s
+            """,
+            (processo_id,),
+        )
 
         conn.commit()
     except Exception as e:
@@ -651,6 +788,85 @@ def marcar_notificacoes_twotask_erro(dedupe_keys, erro):
         ultimo_erro=(erro or "Falha desconhecida")[:1000],
         marcar_envio=False,
     )
+
+
+def buscar_lotes_notificacoes_twotask_para_reenvio(
+    limite_lotes=10,
+    max_tentativas=5,
+    reenviar_enviando_apos_minutos=10,
+):
+    conn = get_connection()
+    if not conn:
+        logging.error("❌ Não foi possível buscar notificações TwoTask para reenvio.")
+        return []
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            WITH lotes AS (
+                SELECT data_criacao
+                FROM twotask_notificacoes
+                WHERE (
+                        status = 'ERRO'
+                        AND COALESCE(tentativas, 0) < %s
+                    )
+                   OR (
+                        status = 'ENVIANDO'
+                        AND data_atualizacao <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+                    )
+                GROUP BY data_criacao
+                ORDER BY MIN(data_atualizacao), data_criacao
+                LIMIT %s
+            )
+            SELECT
+                t.dedupe_key,
+                t.numero_processo,
+                t.id_responsavel,
+                t.observacao,
+                t.data_criacao,
+                t.status,
+                COALESCE(t.tentativas, 0)
+            FROM twotask_notificacoes t
+            INNER JOIN lotes l ON l.data_criacao = t.data_criacao
+            WHERE (
+                    t.status = 'ERRO'
+                    AND COALESCE(t.tentativas, 0) < %s
+                )
+               OR (
+                    t.status = 'ENVIANDO'
+                    AND t.data_atualizacao <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+                )
+            ORDER BY t.data_criacao, t.id
+            """,
+            (
+                max_tentativas,
+                reenviar_enviando_apos_minutos,
+                limite_lotes,
+                max_tentativas,
+                reenviar_enviando_apos_minutos,
+            ),
+        )
+        return [
+            {
+                "_dedupe_key": row[0],
+                "numero_processo": row[1],
+                "id_responsavel": row[2],
+                "observacao": row[3],
+                "_batch_ref": row[4].isoformat() if row[4] else "",
+                "status": row[5],
+                "tentativas": row[6],
+            }
+            for row in cur.fetchall()
+        ]
+    except Exception as e:
+        logging.error("❌ Erro ao buscar notificações TwoTask para reenvio: %s", e)
+        return []
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
 
 
 def _atualizar_status_notificacoes_twotask(

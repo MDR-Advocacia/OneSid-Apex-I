@@ -61,8 +61,12 @@ def post_to_api(lista_processos, *, idempotency_key=None):
                 timeout=API_TIMEOUT,
             )
 
-            if response.status_code in [200, 201]:
-                logging.info("✅ POST enviado com sucesso na tentativa %s.", tentativa)
+            if 200 <= response.status_code < 300:
+                logging.info(
+                    "✅ POST aceito pela API TwoTask na tentativa %s. status=%s",
+                    tentativa,
+                    response.status_code,
+                )
                 return True
 
             last_error = (

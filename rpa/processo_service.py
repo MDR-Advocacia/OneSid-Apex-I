@@ -44,12 +44,21 @@ class ProcessoService:
     ]
     SUBSIDIO_ROW_XPATH = "//tr[contains(@ng-repeat, 'subsidio in vm.resultado.lista')]"
     NEXT_PAGE_XPATH = "//a[contains(@ng-click, 'vm.rechamarPesquisaProximo()')]"
+    EMPTY_SUBSIDIOS_XPATHS = [
+        "//*[contains(normalize-space(.), 'Nenhum registro')]",
+        "//*[contains(normalize-space(.), 'Nenhum resultado')]",
+        "//*[contains(normalize-space(.), 'Não existem registros')]",
+        "//*[contains(normalize-space(.), 'Não foram encontrados registros')]",
+        "//*[contains(normalize-space(.), 'Não há subsídios')]",
+        "//*[contains(normalize-space(.), 'Sem subsídios')]",
+    ]
 
     def __init__(self, driver, portal_client, *, timeout=None):
         self.driver = driver
         self.portal_client = portal_client
         self.timeout = timeout or int(os.getenv("RPA_DEFAULT_TIMEOUT", "30"))
         self.search_timeout = int(os.getenv("RPA_SEARCH_TIMEOUT", "20"))
+        self.header_timeout = int(os.getenv("RPA_HEADER_TIMEOUT", "12"))
         self.pagination_timeout = int(os.getenv("RPA_PAGINATION_TIMEOUT", "15"))
         self.table_settle_timeout = int(os.getenv("RPA_TABLE_SETTLE_TIMEOUT", "8"))
         self.max_paginas = int(os.getenv("RPA_MAX_PAGINAS", "50"))
@@ -155,6 +164,11 @@ class ProcessoService:
         while pagina <= self.max_paginas:
             dados_pagina = self._coletar_subsidios_da_pagina(pagina)
             if not dados_pagina and not lista:
+                if self._empty_subsidios_state_visible():
+                    logging.info("📭 Processo sem linhas de subsídio visíveis.")
+                    self.driver.switch_to.default_content()
+                    return []
+
                 raise PortalElementNotFoundError(
                     "Nenhuma linha de subsídio pôde ser lida",
                     current_url=self.portal_client.safe_current_url(),
@@ -261,6 +275,7 @@ class ProcessoService:
             ) from exc
 
     def _wait_for_processo_header(self, npj):
+        npj_limpo = self.limpar_apenas_digitos(npj)
         npj_exibicao = self.formatar_npj_exibicao(npj)
         def header_ready(_driver):
             self.driver.switch_to.default_content()
@@ -272,13 +287,22 @@ class ProcessoService:
             return npj_exibicao in texto
 
         try:
-            WebDriverWait(self.driver, self.search_timeout, poll_frequency=0.5).until(
+            WebDriverWait(self.driver, self.header_timeout, poll_frequency=0.5).until(
                 header_ready
             )
         except TimeoutException as exc:
+            current_url = self.portal_client.safe_current_url()
+            if f"/editar/{npj_limpo}" in current_url:
+                logging.warning(
+                    "⚠️ Cabeçalho não confirmou o NPJ %s, mas a URL detalhada está correta. Seguindo para coleta.",
+                    npj_exibicao,
+                )
+                self.driver.switch_to.default_content()
+                return
+
             raise PortalElementNotFoundError(
                 f"Cabeçalho do processo não exibiu o NPJ {npj_exibicao}",
-                current_url=self.portal_client.safe_current_url(),
+                current_url=current_url,
                 expected=f"NPJ {npj_exibicao} visível no corpo da página",
             ) from exc
 
@@ -293,6 +317,9 @@ class ProcessoService:
 
             snapshot = self._snapshot_subsidio_rows()
             if not snapshot:
+                if self._empty_subsidios_state_visible():
+                    return True
+
                 state["last_hash"] = None
                 state["stable_hits"] = 0
                 return False
@@ -328,6 +355,9 @@ class ProcessoService:
                 self.SUBSIDIO_ROW_XPATH,
             )
             if not elementos:
+                if self._empty_subsidios_state_visible():
+                    return []
+
                 if tentativa < self.page_read_attempts:
                     self._wait_for_subsidios_renderizados()
                     continue
@@ -415,6 +445,17 @@ class ProcessoService:
                     return True
             except Exception:
                 continue
+        return False
+
+    def _empty_subsidios_state_visible(self):
+        for xpath in self.EMPTY_SUBSIDIOS_XPATHS:
+            elementos = self.portal_client.find_elements_across_frames(By.XPATH, xpath)
+            for elemento in elementos:
+                try:
+                    if elemento.is_displayed():
+                        return True
+                except (StaleElementReferenceException, NoSuchElementException):
+                    continue
         return False
 
     @staticmethod

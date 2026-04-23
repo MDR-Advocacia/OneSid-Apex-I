@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from contextlib import contextmanager
 
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
@@ -37,6 +38,8 @@ class AuthService:
         self.login_timeout = login_timeout or int(os.getenv("RPA_LOGIN_TIMEOUT", "60"))
         self.login_stage_timeout = int(os.getenv("RPA_LOGIN_STAGE_TIMEOUT", "20"))
         self.login_stage_attempts = int(os.getenv("RPA_LOGIN_STAGE_ATTEMPTS", "3"))
+        self.login_lock_enabled = self._env_flag("RPA_LOGIN_LOCK_ENABLED", True)
+        self.login_lock_id = int(os.getenv("RPA_LOGIN_LOCK_ID", "6012026042001"))
 
     def ensure_authenticated(self, force_login=False):
         if not self._credentials_configured():
@@ -53,35 +56,36 @@ class AuthService:
         usuario = os.getenv("BB_USUARIO")
         senha = os.getenv("BB_SENHA")
 
-        try:
-            self.driver.get(self.LOGIN_URL)
-            self.wait_for_document_ready(timeout=self.timeout)
-            state = self._wait_for_login_stage_loaded(timeout=self.login_timeout)
-            if state == "authenticated":
-                logging.info("✅ Login já estava ativo ao abrir o SSO em %s", self.safe_current_url())
+        with self._login_lock():
+            try:
+                self.driver.get(self.LOGIN_URL)
+                self.wait_for_document_ready(timeout=self.timeout)
+                state = self._wait_for_login_stage_loaded(timeout=self.login_timeout)
+                if state == "authenticated":
+                    logging.info("✅ Login já estava ativo ao abrir o SSO em %s", self.safe_current_url())
+                    return True
+
+                username_input = WebDriverWait(self.driver, self.login_timeout).until(
+                    EC.visibility_of_element_located(self.USERNAME_LOCATOR)
+                )
+                username_input.clear()
+                username_input.send_keys(usuario)
+                self._click_and_wait_password_stage()
+
+                password_input = self._wait_for_password_input()
+                password_input.clear()
+                password_input.send_keys(senha)
+                self._click_and_wait_authentication()
+
+                self._wait_until_authenticated()
+                logging.info("✅ Login confirmado com sucesso em %s", self.safe_current_url())
                 return True
-
-            username_input = WebDriverWait(self.driver, self.login_timeout).until(
-                EC.visibility_of_element_located(self.USERNAME_LOCATOR)
-            )
-            username_input.clear()
-            username_input.send_keys(usuario)
-            self._click_and_wait_password_stage()
-
-            password_input = self._wait_for_password_input()
-            password_input.clear()
-            password_input.send_keys(senha)
-            self._click_and_wait_authentication()
-
-            self._wait_until_authenticated()
-            logging.info("✅ Login confirmado com sucesso em %s", self.safe_current_url())
-            return True
-        except TimeoutException as exc:
-            raise LoginError(
-                self._extract_login_error() or "Tempo excedido no fluxo de autenticação",
-                current_url=self.safe_current_url(),
-                expected="URL autenticada e ausência dos campos de login",
-            ) from exc
+            except TimeoutException as exc:
+                raise LoginError(
+                    self._extract_login_error() or "Tempo excedido no fluxo de autenticação",
+                    current_url=self.safe_current_url(),
+                    expected="URL autenticada e ausência dos campos de login",
+                ) from exc
 
     def is_session_active(self, probe=False):
         if self._looks_authenticated():
@@ -329,6 +333,48 @@ class AuthService:
             )
         return result
 
+    @contextmanager
+    def _login_lock(self):
+        if not self.login_lock_enabled:
+            yield
+            return
+
+        conn = None
+        cur = None
+        locked = False
+        try:
+            from bd import database
+
+            conn = database.get_connection()
+            if conn:
+                cur = conn.cursor()
+                logging.info("🔒 Aguardando lock global de login do portal.")
+                cur.execute("SELECT pg_advisory_lock(%s);", (self.login_lock_id,))
+                locked = True
+                logging.info("🔐 Lock global de login adquirido.")
+            else:
+                logging.warning("⚠️ Sem conexão com banco para lock de login. Prosseguindo sem lock.")
+
+            yield
+        finally:
+            if cur and locked:
+                try:
+                    cur.execute("SELECT pg_advisory_unlock(%s);", (self.login_lock_id,))
+                    logging.info("🔓 Lock global de login liberado.")
+                except Exception:
+                    logging.exception("Erro ao liberar lock global de login.")
+            if cur:
+                cur.close()
+            if conn:
+                conn.close()
+
     @staticmethod
     def _credentials_configured():
         return bool(os.getenv("BB_USUARIO")) and bool(os.getenv("BB_SENHA"))
+
+    @staticmethod
+    def _env_flag(name, default=False):
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "on"}
