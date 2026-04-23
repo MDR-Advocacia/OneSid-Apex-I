@@ -152,9 +152,25 @@ class ProcessoService:
                 expected=self.NPJ_REGEX.pattern,
             ) from exc
 
-    def coletar_lista_subsidios(self):
+    def coletar_lista_subsidios(
+        self,
+        *,
+        tolerar_indisponivel=False,
+        wait_timeout=None,
+        incluir_status=False,
+    ):
         logging.info("📊 Coletando lista de subsídios.")
-        self._wait_for_subsidios_renderizados()
+        try:
+            self._wait_for_subsidios_renderizados(timeout=wait_timeout)
+        except PortalTimeoutError:
+            if not tolerar_indisponivel:
+                raise
+
+            logging.warning(
+                "⚠️ Lista de subsídios indisponível após timeout. Monitor seguirá para o próximo processo."
+            )
+            self.driver.switch_to.default_content()
+            return self._resultado_subsidios([], "indisponivel", incluir_status)
 
         lista = []
         chaves_vistas = set()
@@ -167,7 +183,7 @@ class ProcessoService:
                 if self._empty_subsidios_state_visible():
                     logging.info("📭 Processo sem linhas de subsídio visíveis.")
                     self.driver.switch_to.default_content()
-                    return []
+                    return self._resultado_subsidios([], "vazio", incluir_status)
 
                 raise PortalElementNotFoundError(
                     "Nenhuma linha de subsídio pôde ser lida",
@@ -199,6 +215,12 @@ class ProcessoService:
             pagina += 1
 
         self.driver.switch_to.default_content()
+        return self._resultado_subsidios(lista, "ok", incluir_status)
+
+    @staticmethod
+    def _resultado_subsidios(lista, status, incluir_status):
+        if incluir_status:
+            return lista, status
         return lista
 
     def _extrair_dados_subsidio(self, linha):
@@ -306,7 +328,7 @@ class ProcessoService:
                 expected=f"NPJ {npj_exibicao} visível no corpo da página",
             ) from exc
 
-    def _wait_for_subsidios_renderizados(self):
+    def _wait_for_subsidios_renderizados(self, *, timeout=None):
         state = {"last_hash": None, "stable_hits": 0}
 
         def grid_ready(_driver):
@@ -336,10 +358,32 @@ class ProcessoService:
         try:
             WebDriverWait(
                 self.driver,
-                self.search_timeout + self.table_settle_timeout,
+                timeout or (self.search_timeout + self.table_settle_timeout),
                 poll_frequency=0.5,
             ).until(grid_ready)
         except TimeoutException as exc:
+            snapshot = self._snapshot_subsidio_rows()
+            if snapshot:
+                logging.warning(
+                    "⚠️ Tabela de subsídios não estabilizou totalmente, mas %s linha(s) estão legíveis. Seguindo com a coleta.",
+                    len(snapshot),
+                )
+                return
+
+            elementos = self.portal_client.find_elements_across_frames(
+                By.XPATH,
+                self.SUBSIDIO_ROW_XPATH,
+            )
+            if elementos:
+                logging.warning(
+                    "⚠️ Tabela de subsídios oscilou no carregamento, mas há %s linha(s) renderizada(s). Tentando ler mesmo assim.",
+                    len(elementos),
+                )
+                return
+
+            if self._empty_subsidios_state_visible():
+                return
+
             raise PortalTimeoutError(
                 "Tabela de subsídios não estabilizou no tempo esperado",
                 current_url=self.portal_client.safe_current_url(),
@@ -469,7 +513,9 @@ class ProcessoService:
         npj_limpo = ProcessoService.limpar_apenas_digitos(npj)
         if len(npj_limpo) <= 4:
             return npj_limpo
-        return f"{npj_limpo[:4]}/{npj_limpo[4:]}-000"
+        if len(npj_limpo) <= 11:
+            return f"{npj_limpo[:4]}/{npj_limpo[4:]}-000"
+        return f"{npj_limpo[:4]}/{npj_limpo[4:-3]}-{npj_limpo[-3:]}"
 
     @staticmethod
     def _hash_subsidios(dados_pagina):

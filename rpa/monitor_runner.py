@@ -34,12 +34,16 @@ class MonitorRPARunner(PortalRPARunner):
         self.notification_retry_sending_after_minutes = int(
             os.getenv("API_NOTIFICACAO_RETRY_ENVIANDO_MINUTES", "10")
         )
+        self.monitor_table_timeout = int(os.getenv("RPA_MONITOR_TABLE_TIMEOUT", "25"))
+        self.monitor_batch_limit = int(os.getenv("RPA_MONITOR_BATCH_LIMIT", "50"))
 
     def run_cycle(self):
         logging.info("🔍 Buscando processos marcados para monitoramento.")
         database.inicializar_banco()
 
-        processos_monitorados = database.buscar_processos_em_monitoramento()
+        processos_monitorados = database.buscar_processos_em_monitoramento(
+            limit=self.monitor_batch_limit,
+        )
         candidatos_reconciliacao = self._buscar_candidatos_reconciliacao(
             exclude_process_ids={processo["processo_id"] for processo in processos_monitorados}
         )
@@ -62,14 +66,12 @@ class MonitorRPARunner(PortalRPARunner):
         else:
             logging.info("📋 Encontrados %s processos para verificar.", len(processos_monitorados))
 
-        notificacoes = []
         for processo in processos_monitorados:
-            notificacoes.extend(self._processar_processo(processo))
+            notificacoes = self._processar_processo(processo)
+            if notificacoes and self.notifier:
+                self._enviar_notificacoes(notificacoes)
 
         self._reconciliar_falsos_negativos(candidatos_reconciliacao)
-
-        if notificacoes and self.notifier:
-            self._enviar_notificacoes(notificacoes)
 
         if self.notifier:
             self._reenviar_notificacoes_pendentes()
@@ -182,12 +184,65 @@ class MonitorRPARunner(PortalRPARunner):
         if npj_confirmado and npj_confirmado != npj_atual:
             processo_id = database.salvar_processo(cnj, npj_confirmado) or processo_id
             processo["npj"] = npj_confirmado
+            npj_atual = npj_confirmado
             logging.info("🧭 NPJ do monitor atualizado para %s no processo %s.", npj_confirmado, cnj)
 
-        dados_novos = self.processo_service.coletar_lista_subsidios()
+        dados_novos, status_coleta = self._coletar_subsidios_monitorados()
+        if status_coleta == "indisponivel":
+            dados_novos, status_coleta, processo_id = self._tentar_coleta_por_npj_base(
+                processo,
+                processo_id,
+                npj_atual,
+                origem="abertura direta",
+            )
+
+        if status_coleta == "indisponivel" and npj_atual:
+            logging.warning(
+                "⚠️ Subsídios indisponíveis pela abertura direta do NPJ %s. Tentando consulta rápida pelo CNJ %s.",
+                npj_atual,
+                cnj,
+            )
+            npj_fallback = self._reabrir_processo_monitorado(
+                processo,
+                preferir_fallback=True,
+            )
+            if npj_fallback and npj_fallback != processo.get("npj"):
+                processo_id = database.salvar_processo(cnj, npj_fallback) or processo_id
+                processo["npj"] = npj_fallback
+                logging.info(
+                    "🧭 NPJ do monitor corrigido via consulta rápida para %s no processo %s.",
+                    npj_fallback,
+                    cnj,
+                )
+
+            dados_novos, status_coleta = self._coletar_subsidios_monitorados()
+            if status_coleta == "indisponivel":
+                dados_novos, status_coleta, processo_id = self._tentar_coleta_por_npj_base(
+                    processo,
+                    processo_id,
+                    processo.get("npj"),
+                    origem="consulta rápida",
+                )
+
+        if status_coleta == "indisponivel":
+            erro = "Tabela de subsídios indisponível após abertura direta e consulta rápida"
+            logging.warning("⚠️ %s para %s.", erro, cnj)
+            database.registrar_monitoramento_falha(processo_id, erro)
+            return []
+
+        if status_coleta == "vazio":
+            logging.info(
+                "📭 Processo %s sem subsídios visíveis. Atualizando base e desligando monitoramento.",
+                cnj,
+            )
+            database.salvar_lista_subsidios(processo_id, [])
+            database.atualizar_status_monitoramento(processo_id, False)
+            return []
+
         if not dados_novos:
-            logging.warning("⚠️ Tabela de subsídios vazia ou indisponível para %s.", cnj)
-            database.marcar_processo_verificado(processo_id)
+            erro = "Tabela de subsídios sem linhas legíveis"
+            logging.warning("⚠️ %s para %s.", erro, cnj)
+            database.registrar_monitoramento_falha(processo_id, erro)
             return []
 
         notificacoes = self._montar_notificacoes(cnj, subsidios_antigos, dados_novos)
@@ -203,6 +258,57 @@ class MonitorRPARunner(PortalRPARunner):
             database.atualizar_status_monitoramento(processo_id, False)
 
         return notificacoes
+
+    def _coletar_subsidios_monitorados(self):
+        return self.processo_service.coletar_lista_subsidios(
+            tolerar_indisponivel=True,
+            wait_timeout=self.monitor_table_timeout,
+            incluir_status=True,
+        )
+
+    def _tentar_coleta_por_npj_base(self, processo, processo_id, npj_origem, *, origem):
+        npj_base = self._extrair_npj_base(npj_origem)
+        if not npj_base or npj_base == processo.get("npj"):
+            return [], "indisponivel", processo_id
+
+        cnj = processo["cnj"]
+        logging.warning(
+            "⚠️ Subsídios indisponíveis via %s para NPJ %s. Tentando NPJ base %s no processo %s.",
+            origem,
+            npj_origem,
+            npj_base,
+            cnj,
+        )
+
+        try:
+            npj_confirmado = self.processo_service.abrir_processo_por_npj(npj_base)
+        except (PortalElementNotFoundError, PortalNavigationError, PortalTimeoutError) as exc:
+            logging.warning(
+                "⚠️ Tentativa pelo NPJ base %s falhou para %s: %s",
+                npj_base,
+                cnj,
+                exc,
+            )
+            return [], "indisponivel", processo_id
+
+        dados_novos, status_coleta = self._coletar_subsidios_monitorados()
+        if status_coleta != "indisponivel" and npj_confirmado != processo.get("npj"):
+            processo_id = database.salvar_processo(cnj, npj_confirmado) or processo_id
+            processo["npj"] = npj_confirmado
+            logging.info(
+                "🧭 NPJ do monitor corrigido para base %s no processo %s.",
+                npj_confirmado,
+                cnj,
+            )
+
+        return dados_novos, status_coleta, processo_id
+
+    @staticmethod
+    def _extrair_npj_base(npj):
+        apenas_digitos = "".join(ch for ch in str(npj or "") if ch.isdigit())
+        if len(apenas_digitos) <= 11:
+            return ""
+        return apenas_digitos[:-3]
 
     def _reabrir_processo_monitorado(self, processo, preferir_fallback=False):
         cnj = processo["cnj"]
@@ -366,10 +472,26 @@ class MonitorRPARunner(PortalRPARunner):
             processo["npj"] = npj_confirmado
             logging.info("🧭 NPJ reconciliado para %s no processo %s.", npj_confirmado, cnj)
 
-        dados_novos = self.processo_service.coletar_lista_subsidios()
+        dados_novos, status_coleta = self._coletar_subsidios_monitorados()
+        if status_coleta == "indisponivel":
+            erro = "Reconciliação com tabela de subsídios indisponível"
+            logging.warning("⚠️ %s para %s.", erro, cnj)
+            database.registrar_monitoramento_falha(processo_id, erro)
+            return
+
+        if status_coleta == "vazio":
+            logging.info(
+                "📭 Reconciliação de %s sem subsídios visíveis. Mantendo fora do monitoramento.",
+                cnj,
+            )
+            database.salvar_lista_subsidios(processo_id, [])
+            database.atualizar_status_monitoramento(processo_id, False)
+            return
+
         if not dados_novos:
-            logging.warning("⚠️ Reconciliação sem subsídios legíveis para %s.", cnj)
-            database.marcar_processo_verificado(processo_id)
+            erro = "Reconciliação sem linhas de subsídio legíveis"
+            logging.warning("⚠️ %s para %s.", erro, cnj)
+            database.registrar_monitoramento_falha(processo_id, erro)
             return
 
         database.salvar_lista_subsidios(processo_id, dados_novos)

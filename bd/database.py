@@ -14,6 +14,9 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 SCHEMA_INIT_LOCK_ID = 6012026041501
 TASK_ERROR_RETRY_BACKOFF_MINUTES = int(os.getenv("RPA_TASK_ERROR_RETRY_BACKOFF_MINUTES", "120"))
 TASK_MAX_ERROR_RETRIES = int(os.getenv("RPA_TASK_MAX_ERROR_RETRIES", "3"))
+MONITOR_FAILURE_BACKOFF_MINUTES = int(
+    os.getenv("RPA_MONITOR_FAILURE_BACKOFF_MINUTES", "120")
+)
 TASK_OPEN_STATUSES = ("PENDENTE", "ERRO")
 TASK_DUPLICATE_STATUS = "DUPLICADO"
 
@@ -57,6 +60,23 @@ def inicializar_banco():
         cur.execute("""
             ALTER TABLE processos 
             ADD COLUMN IF NOT EXISTS em_monitoramento BOOLEAN DEFAULT FALSE;
+        """)
+        cur.execute("""
+            ALTER TABLE processos
+            ADD COLUMN IF NOT EXISTS monitoramento_falhas INTEGER DEFAULT 0;
+        """)
+        cur.execute("""
+            ALTER TABLE processos
+            ADD COLUMN IF NOT EXISTS monitoramento_ultimo_erro TEXT;
+        """)
+        cur.execute("""
+            ALTER TABLE processos
+            ADD COLUMN IF NOT EXISTS monitoramento_ultima_falha TIMESTAMP;
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_processos_monitoramento_fila
+            ON processos (data_atualizacao, id)
+            WHERE em_monitoramento = TRUE;
         """)
 
         # Tabela Subsídios
@@ -420,7 +440,10 @@ def atualizar_status_monitoramento(processo_id, ativar=True):
             """
             UPDATE processos
             SET em_monitoramento = %s,
-                data_atualizacao = CURRENT_TIMESTAMP
+                data_atualizacao = CURRENT_TIMESTAMP,
+                monitoramento_falhas = 0,
+                monitoramento_ultimo_erro = NULL,
+                monitoramento_ultima_falha = NULL
             WHERE id = %s
             """,
             (ativar, processo_id),
@@ -437,6 +460,10 @@ def atualizar_status_monitoramento(processo_id, ativar=True):
 
 
 def marcar_processo_verificado(processo_id):
+    registrar_monitoramento_sucesso(processo_id)
+
+
+def registrar_monitoramento_sucesso(processo_id):
     conn = get_connection()
     if not conn:
         return
@@ -446,7 +473,10 @@ def marcar_processo_verificado(processo_id):
         cur.execute(
             """
             UPDATE processos
-            SET data_atualizacao = CURRENT_TIMESTAMP
+            SET data_atualizacao = CURRENT_TIMESTAMP,
+                monitoramento_falhas = 0,
+                monitoramento_ultimo_erro = NULL,
+                monitoramento_ultima_falha = NULL
             WHERE id = %s
             """,
             (processo_id,),
@@ -458,6 +488,43 @@ def marcar_processo_verificado(processo_id):
         if cur:
             cur.close()
         conn.close()
+
+
+def registrar_monitoramento_falha(processo_id, erro):
+    conn = get_connection()
+    if not conn:
+        return
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE processos
+            SET data_atualizacao = CURRENT_TIMESTAMP,
+                monitoramento_falhas = COALESCE(monitoramento_falhas, 0) + 1,
+                monitoramento_ultimo_erro = %s,
+                monitoramento_ultima_falha = CURRENT_TIMESTAMP
+            WHERE id = %s
+            RETURNING monitoramento_falhas
+            """,
+            ((erro or "Falha desconhecida no monitoramento")[:1000], processo_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        if row:
+            logging.warning(
+                "⚠️ Falha de monitoramento registrada para processo ID %s. Falhas consecutivas: %s.",
+                processo_id,
+                row[0],
+            )
+    except Exception as e:
+        logging.error(f"Erro ao registrar falha de monitoramento do processo {processo_id}: {e}")
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
 
 def salvar_lista_subsidios(processo_id, lista_dados):
     conn = get_connection()
@@ -537,7 +604,10 @@ def salvar_lista_subsidios(processo_id, lista_dados):
         cur.execute(
             """
             UPDATE processos
-            SET data_atualizacao = CURRENT_TIMESTAMP
+            SET data_atualizacao = CURRENT_TIMESTAMP,
+                monitoramento_falhas = 0,
+                monitoramento_ultimo_erro = NULL,
+                monitoramento_ultima_falha = NULL
             WHERE id = %s
             """,
             (processo_id,),
@@ -609,11 +679,12 @@ def recuperar_subsidios_anteriores(processo_id):
     return lista
 
 
-def buscar_processos_em_monitoramento():
+def buscar_processos_em_monitoramento(limit=None):
     conn = get_connection()
     if not conn:
         return []
 
+    limite_consulta = limit if limit and limit > 0 else None
     cur = None
     try:
         cur = conn.cursor()
@@ -622,8 +693,15 @@ def buscar_processos_em_monitoramento():
             SELECT id, cnj, npj
             FROM processos
             WHERE em_monitoramento = TRUE
-            ORDER BY data_atualizacao ASC, id ASC
-            """
+              AND (
+                    COALESCE(monitoramento_falhas, 0) = 0
+                    OR monitoramento_ultima_falha IS NULL
+                    OR monitoramento_ultima_falha <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+              )
+            ORDER BY data_atualizacao ASC, COALESCE(monitoramento_falhas, 0) ASC, id ASC
+            LIMIT %s
+            """,
+            (MONITOR_FAILURE_BACKOFF_MINUTES, limite_consulta),
         )
         return [
             {"processo_id": row[0], "cnj": row[1], "npj": row[2]}
@@ -653,10 +731,15 @@ def buscar_processos_para_reconciliacao(*, limit=10, lookback_hours=168):
             WHERE COALESCE(em_monitoramento, FALSE) = FALSE
               AND npj IS NOT NULL
               AND data_atualizacao >= CURRENT_TIMESTAMP - (%s * INTERVAL '1 hour')
+              AND (
+                    COALESCE(monitoramento_falhas, 0) = 0
+                    OR monitoramento_ultima_falha IS NULL
+                    OR monitoramento_ultima_falha <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+              )
             ORDER BY data_atualizacao DESC, id DESC
             LIMIT %s
             """,
-            (lookback_hours, limit),
+            (lookback_hours, MONITOR_FAILURE_BACKOFF_MINUTES, limit),
         )
         return [
             {"processo_id": row[0], "cnj": row[1], "npj": row[2]}
