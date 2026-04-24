@@ -568,36 +568,72 @@ class MonitorRPARunner(PortalRPARunner):
             "API TwoTask retornou falha no envio do lote",
         )
 
-    @staticmethod
-    def _montar_notificacoes(cnj, subsidios_antigos, dados_novos):
+    @classmethod
+    def _montar_notificacoes(cls, cnj, subsidios_antigos, dados_novos):
         itens_alterados = []
+        chaves_itens_alterados = set()
+        tem_pendencia_atual = any(
+            cls._normalizar_status(item.get("estado")) == "SOLICITADO"
+            for item in dados_novos
+        )
+        correspondencias_usadas = set()
+        fallback_utilizado = False
+
         for antigo in subsidios_antigos:
-            estado_antigo = (antigo.get("estado") or "").upper()
+            estado_antigo = cls._normalizar_status(antigo.get("estado"))
             if estado_antigo != "SOLICITADO":
                 continue
 
-            correspondente_novo = next(
-                (
-                    item
-                    for item in dados_novos
-                    if item["item"] == antigo["item"]
-                    and item["tipo"] == antigo["tipo"]
-                    and item.get("data_limite") == antigo.get("data_limite")
-                ),
-                None,
+            indice_correspondente, correspondente_novo = cls._buscar_correspondente_novo(
+                antigo,
+                dados_novos,
+                correspondencias_usadas,
             )
 
-            if correspondente_novo and correspondente_novo["estado"].upper() != "SOLICITADO":
-                dt_info = (
-                    f" ({correspondente_novo.get('data_limite')})"
-                    if correspondente_novo.get("data_limite")
-                    else ""
+            if correspondente_novo is not None:
+                correspondencias_usadas.add(indice_correspondente)
+                estado_novo = cls._normalizar_status(correspondente_novo.get("estado"))
+                if estado_novo != "SOLICITADO":
+                    cls._adicionar_item_alterado(
+                        itens_alterados,
+                        chaves_itens_alterados,
+                        tipo=antigo.get("tipo"),
+                        item=antigo.get("item"),
+                        data_limite=antigo.get("data_limite"),
+                        estado=correspondente_novo.get("estado"),
+                    )
+                continue
+
+            if not tem_pendencia_atual:
+                estado_fallback = cls._inferir_estado_final_sem_correspondencia(
+                    antigo,
+                    dados_novos,
                 )
-                itens_alterados.append(
-                    f"{correspondente_novo['tipo']} "
-                    f"{correspondente_novo['item']}{dt_info}: "
-                    f"{correspondente_novo['estado']}"
+                if not estado_fallback:
+                    logging.warning(
+                        "⚠️ Processo %s ficou sem pendências, mas o subsídio monitorado '%s | %s | %s' terminou sem correspondência confiável. Aviso ignorado para evitar texto incorreto.",
+                        cnj,
+                        antigo.get("tipo") or "",
+                        antigo.get("item") or "",
+                        antigo.get("data_limite") or "",
+                    )
+                    continue
+
+                fallback_utilizado = True
+                cls._adicionar_item_alterado(
+                    itens_alterados,
+                    chaves_itens_alterados,
+                    tipo=antigo.get("tipo"),
+                    item=antigo.get("item"),
+                    data_limite=antigo.get("data_limite"),
+                    estado=estado_fallback,
                 )
+
+        if fallback_utilizado:
+            logging.warning(
+                "⚠️ Processo %s saiu de 'SOLICITADO' para sem pendências sem correspondência exata linha a linha. Estado final inferido a partir do contexto do subsídio atual.",
+                cnj,
+            )
 
         if not itens_alterados:
             return []
@@ -633,6 +669,134 @@ class MonitorRPARunner(PortalRPARunner):
                 }
             )
         return notificacoes
+
+    @classmethod
+    def _buscar_correspondente_novo(cls, antigo, dados_novos, indices_usados=None):
+        indices_usados = indices_usados or set()
+        comparadores = (
+            lambda item: cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
+            and cls._campos_equivalentes(item.get("item"), antigo.get("item"))
+            and cls._campos_equivalentes(item.get("data_limite"), antigo.get("data_limite")),
+            lambda item: cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
+            and cls._campos_equivalentes(item.get("item"), antigo.get("item")),
+            lambda item: cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
+            and cls._campos_equivalentes(item.get("data_limite"), antigo.get("data_limite")),
+        )
+
+        for comparador in comparadores:
+            correspondentes = [
+                (indice, item)
+                for indice, item in enumerate(dados_novos)
+                if indice not in indices_usados and comparador(item)
+            ]
+            if not correspondentes:
+                continue
+
+            concluido = next(
+                (
+                    (indice, item)
+                    for indice, item in correspondentes
+                    if cls._normalizar_status(item.get("estado")) != "SOLICITADO"
+                ),
+                None,
+            )
+            return concluido or correspondentes[0]
+
+        return None, None
+
+    @classmethod
+    def _inferir_estado_final_sem_correspondencia(cls, antigo, dados_novos):
+        grupos = (
+            [
+                item
+                for item in dados_novos
+                if cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
+                and cls._campos_equivalentes(item.get("item"), antigo.get("item"))
+            ],
+            [
+                item
+                for item in dados_novos
+                if cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
+                and cls._campos_equivalentes(item.get("data_limite"), antigo.get("data_limite"))
+            ],
+            [
+                item
+                for item in dados_novos
+                if cls._campos_equivalentes(item.get("item"), antigo.get("item"))
+                and cls._campos_equivalentes(item.get("data_limite"), antigo.get("data_limite"))
+            ],
+            [
+                item
+                for item in dados_novos
+                if cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
+            ],
+            [
+                item
+                for item in dados_novos
+                if cls._campos_equivalentes(item.get("item"), antigo.get("item"))
+            ],
+            list(dados_novos),
+        )
+
+        for grupo in grupos:
+            estados = [
+                item.get("estado")
+                for item in grupo
+                if cls._normalizar_status(item.get("estado"))
+                and cls._normalizar_status(item.get("estado")) != "SOLICITADO"
+            ]
+            if not estados:
+                continue
+
+            estados_normalizados = {
+                cls._normalizar_status(estado): estado
+                for estado in estados
+            }
+            if len(estados_normalizados) == 1:
+                return next(iter(estados_normalizados.values()))
+
+        return ""
+
+    @staticmethod
+    def _adicionar_item_alterado(
+        itens_alterados,
+        chaves_itens_alterados,
+        *,
+        tipo,
+        item,
+        data_limite,
+        estado,
+    ):
+        chave = (
+            MonitorRPARunner._normalizar_texto(tipo),
+            MonitorRPARunner._normalizar_texto(item),
+            MonitorRPARunner._normalizar_texto(data_limite),
+            MonitorRPARunner._normalizar_texto(estado),
+        )
+        if chave in chaves_itens_alterados:
+            return
+
+        tipo = (tipo or "").strip()
+        item = (item or "").strip()
+        estado = (estado or "").strip()
+        data_limite = (data_limite or "").strip()
+        dt_info = f" ({data_limite})" if data_limite else ""
+        itens_alterados.append(f"{tipo} {item}{dt_info}: {estado}".strip())
+        chaves_itens_alterados.add(chave)
+
+    @staticmethod
+    def _campos_equivalentes(valor_a, valor_b):
+        return MonitorRPARunner._normalizar_texto(valor_a) == MonitorRPARunner._normalizar_texto(
+            valor_b
+        )
+
+    @staticmethod
+    def _normalizar_status(status):
+        return MonitorRPARunner._normalizar_texto(status)
+
+    @staticmethod
+    def _normalizar_texto(valor):
+        return " ".join(str(valor or "").split()).upper()
 
     @staticmethod
     def _env_flag(name, default=False):
