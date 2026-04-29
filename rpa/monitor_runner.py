@@ -231,6 +231,18 @@ class MonitorRPARunner(PortalRPARunner):
             return []
 
         if status_coleta == "vazio":
+            if self._tem_solicitado_sem_retorno(subsidios_antigos, dados_novos):
+                logging.warning(
+                    "⚠️ Processo %s retornou lista vazia, mas há subsídio SOLICITADO "
+                    "anterior sem retorno confirmado. Mantendo monitoramento.",
+                    cnj,
+                )
+                database.registrar_monitoramento_falha(
+                    processo_id,
+                    "Lista vazia com subsídio SOLICITADO anterior sem retorno confirmado",
+                )
+                return []
+
             logging.info(
                 "📭 Processo %s sem subsídios visíveis. Atualizando base e desligando monitoramento.",
                 cnj,
@@ -246,14 +258,29 @@ class MonitorRPARunner(PortalRPARunner):
             return []
 
         notificacoes = self._montar_notificacoes(cnj, subsidios_antigos, dados_novos)
-        database.salvar_lista_subsidios(processo_id, dados_novos)
+        solicitados_sem_retorno = self._solicitados_sem_retorno(
+            subsidios_antigos,
+            dados_novos,
+        )
+        database.salvar_lista_subsidios(
+            processo_id,
+            dados_novos,
+            preservar_solicitados_sem_correspondencia=True,
+        )
 
         tem_pendencia = any(
             item["estado"].upper() == "SOLICITADO"
             for item in dados_novos
             if item.get("estado")
         )
-        if not tem_pendencia:
+        if solicitados_sem_retorno:
+            logging.warning(
+                "⚠️ Processo %s mantém %s subsídio(s) SOLICITADO(s) sem retorno confirmado. "
+                "Monitoramento permanecerá ativo.",
+                cnj,
+                len(solicitados_sem_retorno),
+            )
+        elif not tem_pendencia:
             logging.info("🎉 Processo %s sem pendências. Desligando monitoramento.", cnj)
             database.atualizar_status_monitoramento(processo_id, False)
 
@@ -572,12 +599,7 @@ class MonitorRPARunner(PortalRPARunner):
     def _montar_notificacoes(cls, cnj, subsidios_antigos, dados_novos):
         itens_alterados = []
         chaves_itens_alterados = set()
-        tem_pendencia_atual = any(
-            cls._normalizar_status(item.get("estado")) == "SOLICITADO"
-            for item in dados_novos
-        )
         correspondencias_usadas = set()
-        fallback_utilizado = False
 
         for antigo in subsidios_antigos:
             estado_antigo = cls._normalizar_status(antigo.get("estado"))
@@ -604,35 +626,13 @@ class MonitorRPARunner(PortalRPARunner):
                     )
                 continue
 
-            if not tem_pendencia_atual:
-                estado_fallback = cls._inferir_estado_final_sem_correspondencia(
-                    antigo,
-                    dados_novos,
-                )
-                if not estado_fallback:
-                    logging.warning(
-                        "⚠️ Processo %s ficou sem pendências, mas o subsídio monitorado '%s | %s | %s' terminou sem correspondência confiável. Aviso ignorado para evitar texto incorreto.",
-                        cnj,
-                        antigo.get("tipo") or "",
-                        antigo.get("item") or "",
-                        antigo.get("data_limite") or "",
-                    )
-                    continue
-
-                fallback_utilizado = True
-                cls._adicionar_item_alterado(
-                    itens_alterados,
-                    chaves_itens_alterados,
-                    tipo=antigo.get("tipo"),
-                    item=antigo.get("item"),
-                    data_limite=antigo.get("data_limite"),
-                    estado=estado_fallback,
-                )
-
-        if fallback_utilizado:
             logging.warning(
-                "⚠️ Processo %s saiu de 'SOLICITADO' para sem pendências sem correspondência exata linha a linha. Estado final inferido a partir do contexto do subsídio atual.",
+                "⚠️ Processo %s possui subsídio SOLICITADO sem correspondência exata "
+                "na nova coleta. Aviso ignorado até retorno confirmado: %s | %s | %s",
                 cnj,
+                antigo.get("tipo") or "",
+                antigo.get("item") or "",
+                antigo.get("data_limite") or "",
             )
 
         if not itens_alterados:
@@ -671,36 +671,44 @@ class MonitorRPARunner(PortalRPARunner):
         return notificacoes
 
     @classmethod
-    def _buscar_correspondente_novo(cls, antigo, dados_novos, indices_usados=None):
-        indices_usados = indices_usados or set()
-        comparadores = (
-            lambda item: cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
-            and cls._campos_equivalentes(item.get("item"), antigo.get("item"))
-            and cls._campos_equivalentes(item.get("data_limite"), antigo.get("data_limite")),
-            lambda item: cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
-            and cls._campos_equivalentes(item.get("item"), antigo.get("item")),
-            lambda item: cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
-            and cls._campos_equivalentes(item.get("data_limite"), antigo.get("data_limite")),
-        )
+    def _tem_solicitado_sem_retorno(cls, subsidios_antigos, dados_novos):
+        return bool(cls._solicitados_sem_retorno(subsidios_antigos, dados_novos))
 
-        for comparador in comparadores:
-            correspondentes = [
-                (indice, item)
-                for indice, item in enumerate(dados_novos)
-                if indice not in indices_usados and comparador(item)
-            ]
-            if not correspondentes:
+    @classmethod
+    def _solicitados_sem_retorno(cls, subsidios_antigos, dados_novos):
+        solicitados = []
+        correspondencias_usadas = set()
+
+        for antigo in subsidios_antigos:
+            if cls._normalizar_status(antigo.get("estado")) != "SOLICITADO":
                 continue
 
-            concluido = next(
-                (
-                    (indice, item)
-                    for indice, item in correspondentes
-                    if cls._normalizar_status(item.get("estado")) != "SOLICITADO"
-                ),
-                None,
+            indice_correspondente, correspondente_novo = cls._buscar_correspondente_novo(
+                antigo,
+                dados_novos,
+                correspondencias_usadas,
             )
-            return concluido or correspondentes[0]
+            if correspondente_novo is not None:
+                correspondencias_usadas.add(indice_correspondente)
+                if cls._normalizar_status(correspondente_novo.get("estado")) != "SOLICITADO":
+                    continue
+
+            solicitados.append(antigo)
+
+        return solicitados
+
+    @classmethod
+    def _buscar_correspondente_novo(cls, antigo, dados_novos, indices_usados=None):
+        indices_usados = indices_usados or set()
+        for indice, item in enumerate(dados_novos):
+            if indice in indices_usados:
+                continue
+            if (
+                cls._campos_equivalentes(item.get("tipo"), antigo.get("tipo"))
+                and cls._campos_equivalentes(item.get("item"), antigo.get("item"))
+                and cls._campos_equivalentes(item.get("data_limite"), antigo.get("data_limite"))
+            ):
+                return indice, item
 
         return None, None
 

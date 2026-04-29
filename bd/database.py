@@ -526,7 +526,12 @@ def registrar_monitoramento_falha(processo_id, erro):
         conn.close()
 
 
-def salvar_lista_subsidios(processo_id, lista_dados):
+def salvar_lista_subsidios(
+    processo_id,
+    lista_dados,
+    *,
+    preservar_solicitados_sem_correspondencia=False,
+):
     conn = get_connection()
     if not conn: return
     cur = None
@@ -599,6 +604,19 @@ def salvar_lista_subsidios(processo_id, lista_dados):
         for existente in existentes:
             if existente["id"] in preservados:
                 continue
+            if (
+                preservar_solicitados_sem_correspondencia
+                and _normalizar_estado(existente["estado"]) == "SOLICITADO"
+            ):
+                logging.warning(
+                    "⚠️ Subsídio SOLICITADO preservado sem correspondência na nova coleta "
+                    "para processo ID %s: %s | %s | %s",
+                    processo_id,
+                    existente["tipo"],
+                    existente["item"],
+                    existente["data_limite"],
+                )
+                continue
             cur.execute("DELETE FROM subsidios WHERE id = %s", (existente["id"],))
 
         cur.execute(
@@ -642,16 +660,11 @@ def _buscar_subsidio_existente(existentes, subsidio, usados):
         ):
             return existente
 
-    for existente in existentes:
-        if existente["id"] in usados:
-            continue
-        if (
-            existente["tipo"] == subsidio["tipo"]
-            and existente["item"] == subsidio["item"]
-        ):
-            return existente
-
     return None
+
+
+def _normalizar_estado(estado):
+    return " ".join(str(estado or "").split()).upper()
 
 def recuperar_subsidios_anteriores(processo_id):
     """Retorna lista de dicionários com os subsídios atuais do banco para comparação."""
