@@ -583,7 +583,10 @@ class MonitorRPARunner(PortalRPARunner):
                 enviado = self.notifier(payload)
         except Exception as exc:
             logging.exception("❌ Erro inesperado ao enviar notificações para o TwoTask.")
-            database.marcar_notificacoes_twotask_erro(dedupe_keys, str(exc))
+            erro = str(exc)
+            if getattr(exc, "retryable", True) is False:
+                erro = f"AUTH_NON_RETRYABLE: {erro}"
+            database.marcar_notificacoes_twotask_erro(dedupe_keys, erro)
             return
 
         if enviado:

@@ -907,6 +907,7 @@ def buscar_lotes_notificacoes_twotask_para_reenvio(
                 WHERE (
                         status = 'ERRO'
                         AND COALESCE(tentativas, 0) < %s
+                        AND COALESCE(ultimo_erro, '') NOT LIKE 'AUTH_NON_RETRYABLE:%%'
                     )
                    OR (
                         status = 'ENVIANDO'
@@ -915,8 +916,29 @@ def buscar_lotes_notificacoes_twotask_para_reenvio(
                 GROUP BY data_criacao
                 ORDER BY MIN(data_atualizacao), data_criacao
                 LIMIT %s
+            ),
+            selecionadas AS (
+                SELECT t.id
+                FROM twotask_notificacoes t
+                INNER JOIN lotes l ON l.data_criacao = t.data_criacao
+                WHERE (
+                        t.status = 'ERRO'
+                        AND COALESCE(t.tentativas, 0) < %s
+                        AND COALESCE(t.ultimo_erro, '') NOT LIKE 'AUTH_NON_RETRYABLE:%%'
+                    )
+                   OR (
+                        t.status = 'ENVIANDO'
+                        AND t.data_atualizacao <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
+                    )
+                ORDER BY t.data_criacao, t.id
+                FOR UPDATE SKIP LOCKED
             )
-            SELECT
+            UPDATE twotask_notificacoes t
+            SET status = 'ENVIANDO',
+                data_atualizacao = CURRENT_TIMESTAMP
+            FROM selecionadas s
+            WHERE t.id = s.id
+            RETURNING
                 t.dedupe_key,
                 t.numero_processo,
                 t.id_responsavel,
@@ -924,17 +946,6 @@ def buscar_lotes_notificacoes_twotask_para_reenvio(
                 t.data_criacao,
                 t.status,
                 COALESCE(t.tentativas, 0)
-            FROM twotask_notificacoes t
-            INNER JOIN lotes l ON l.data_criacao = t.data_criacao
-            WHERE (
-                    t.status = 'ERRO'
-                    AND COALESCE(t.tentativas, 0) < %s
-                )
-               OR (
-                    t.status = 'ENVIANDO'
-                    AND t.data_atualizacao <= CURRENT_TIMESTAMP - (%s * INTERVAL '1 minute')
-                )
-            ORDER BY t.data_criacao, t.id
             """,
             (
                 max_tentativas,
@@ -944,6 +955,8 @@ def buscar_lotes_notificacoes_twotask_para_reenvio(
                 reenviar_enviando_apos_minutos,
             ),
         )
+        rows = cur.fetchall()
+        conn.commit()
         return [
             {
                 "_dedupe_key": row[0],
@@ -954,9 +967,10 @@ def buscar_lotes_notificacoes_twotask_para_reenvio(
                 "status": row[5],
                 "tentativas": row[6],
             }
-            for row in cur.fetchall()
+            for row in rows
         ]
     except Exception as e:
+        conn.rollback()
         logging.error("❌ Erro ao buscar notificações TwoTask para reenvio: %s", e)
         return []
     finally:

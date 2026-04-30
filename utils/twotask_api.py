@@ -23,6 +23,12 @@ ALLOW_POST_RETRY = os.getenv("API_NOTIFICACAO_PERMITIR_RETRY_POST", "false").str
 }
 
 
+class ApiNotificationError(RuntimeError):
+    def __init__(self, message, *, retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def post_to_api(lista_processos, *, idempotency_key=None):
     """
     Recebe uma lista de dicionários com os dados dos processos atualizados
@@ -80,6 +86,14 @@ def post_to_api(lista_processos, *, idempotency_key=None):
             last_error = (
                 f"status={response.status_code} body={response.text[:500]}"
             )
+            if response.status_code in {401, 403}:
+                logging.error(
+                    "❌ Erro de autenticação na API %s: %s",
+                    API_NOME,
+                    last_error,
+                )
+                raise ApiNotificationError(last_error, retryable=False)
+
             logging.error(
                 "❌ Erro na API %s na tentativa %s/%s: %s",
                 API_NOME,
@@ -96,8 +110,9 @@ def post_to_api(lista_processos, *, idempotency_key=None):
                 e,
             )
 
-    logging.error("❌ Envio para API %s falhou em definitivo: %s", API_NOME, last_error or "erro desconhecido")
-    return False
+    message = last_error or "erro desconhecido"
+    logging.error("❌ Envio para API %s falhou em definitivo: %s", API_NOME, message)
+    raise ApiNotificationError(message, retryable=True)
 
 
 def _gerar_batch_key(lista_processos):
