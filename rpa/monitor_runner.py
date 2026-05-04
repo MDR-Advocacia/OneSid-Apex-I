@@ -36,10 +36,6 @@ class MonitorRPARunner(PortalRPARunner):
         )
         self.monitor_table_timeout = int(os.getenv("RPA_MONITOR_TABLE_TIMEOUT", "25"))
         self.monitor_batch_limit = int(os.getenv("RPA_MONITOR_BATCH_LIMIT", "50"))
-        self.notify_missing_requested_subsidio = self._env_flag(
-            "RPA_MONITOR_NOTIFICAR_SOLICITADO_AUSENTE",
-            True,
-        )
 
     def run_cycle(self):
         logging.info("🔍 Buscando processos marcados para monitoramento.")
@@ -235,11 +231,7 @@ class MonitorRPARunner(PortalRPARunner):
             return []
 
         if status_coleta == "vazio":
-            if self._tem_solicitado_sem_retorno(
-                subsidios_antigos,
-                dados_novos,
-                tratar_ausente_como_retorno=False,
-            ):
+            if self._tem_solicitado_sem_retorno(subsidios_antigos, dados_novos):
                 logging.warning(
                     "⚠️ Processo %s retornou lista vazia, mas há subsídio SOLICITADO "
                     "anterior sem retorno confirmado. Mantendo monitoramento.",
@@ -269,17 +261,15 @@ class MonitorRPARunner(PortalRPARunner):
             cnj,
             subsidios_antigos,
             dados_novos,
-            notificar_solicitado_ausente=self.notify_missing_requested_subsidio,
         )
         solicitados_sem_retorno = self._solicitados_sem_retorno(
             subsidios_antigos,
             dados_novos,
-            tratar_ausente_como_retorno=self.notify_missing_requested_subsidio,
         )
         database.salvar_lista_subsidios(
             processo_id,
             dados_novos,
-            preservar_solicitados_sem_correspondencia=not self.notify_missing_requested_subsidio,
+            preservar_solicitados_sem_correspondencia=True,
         )
 
         tem_pendencia = any(
@@ -613,14 +603,7 @@ class MonitorRPARunner(PortalRPARunner):
         )
 
     @classmethod
-    def _montar_notificacoes(
-        cls,
-        cnj,
-        subsidios_antigos,
-        dados_novos,
-        *,
-        notificar_solicitado_ausente=True,
-    ):
+    def _montar_notificacoes(cls, cnj, subsidios_antigos, dados_novos):
         itens_alterados = []
         chaves_itens_alterados = set()
         correspondencias_usadas = set()
@@ -648,31 +631,6 @@ class MonitorRPARunner(PortalRPARunner):
                         data_limite=antigo.get("data_limite"),
                         estado=correspondente_novo.get("estado"),
                     )
-                continue
-
-            estado_retorno = cls._estado_retorno_sem_correspondencia(
-                antigo,
-                dados_novos,
-                notificar_solicitado_ausente=notificar_solicitado_ausente,
-            )
-            if estado_retorno:
-                logging.info(
-                    "🔎 Processo %s teve subsídio SOLICITADO sem correspondência exata "
-                    "na nova coleta. Tratando como retorno: %s | %s | %s -> %s",
-                    cnj,
-                    antigo.get("tipo") or "",
-                    antigo.get("item") or "",
-                    antigo.get("data_limite") or "",
-                    estado_retorno,
-                )
-                cls._adicionar_item_alterado(
-                    itens_alterados,
-                    chaves_itens_alterados,
-                    tipo=antigo.get("tipo"),
-                    item=antigo.get("item"),
-                    data_limite=antigo.get("data_limite"),
-                    estado=estado_retorno,
-                )
                 continue
 
             logging.warning(
@@ -720,29 +678,11 @@ class MonitorRPARunner(PortalRPARunner):
         return notificacoes
 
     @classmethod
-    def _tem_solicitado_sem_retorno(
-        cls,
-        subsidios_antigos,
-        dados_novos,
-        *,
-        tratar_ausente_como_retorno=True,
-    ):
-        return bool(
-            cls._solicitados_sem_retorno(
-                subsidios_antigos,
-                dados_novos,
-                tratar_ausente_como_retorno=tratar_ausente_como_retorno,
-            )
-        )
+    def _tem_solicitado_sem_retorno(cls, subsidios_antigos, dados_novos):
+        return bool(cls._solicitados_sem_retorno(subsidios_antigos, dados_novos))
 
     @classmethod
-    def _solicitados_sem_retorno(
-        cls,
-        subsidios_antigos,
-        dados_novos,
-        *,
-        tratar_ausente_como_retorno=True,
-    ):
+    def _solicitados_sem_retorno(cls, subsidios_antigos, dados_novos):
         solicitados = []
         correspondencias_usadas = set()
 
@@ -759,36 +699,10 @@ class MonitorRPARunner(PortalRPARunner):
                 correspondencias_usadas.add(indice_correspondente)
                 if cls._normalizar_status(correspondente_novo.get("estado")) != "SOLICITADO":
                     continue
-            elif (
-                tratar_ausente_como_retorno
-                and cls._estado_retorno_sem_correspondencia(
-                    antigo,
-                    dados_novos,
-                    notificar_solicitado_ausente=True,
-                )
-            ):
-                continue
 
             solicitados.append(antigo)
 
         return solicitados
-
-    @classmethod
-    def _estado_retorno_sem_correspondencia(
-        cls,
-        antigo,
-        dados_novos,
-        *,
-        notificar_solicitado_ausente=True,
-    ):
-        estado_inferido = cls._inferir_estado_final_sem_correspondencia(antigo, dados_novos)
-        if estado_inferido:
-            return estado_inferido
-
-        if not notificar_solicitado_ausente:
-            return ""
-
-        return "Retorno identificado (não está mais como Solicitado no portal)"
 
     @classmethod
     def _buscar_correspondente_novo(cls, antigo, dados_novos, indices_usados=None):
