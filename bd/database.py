@@ -74,6 +74,14 @@ def inicializar_banco():
             ADD COLUMN IF NOT EXISTS monitoramento_ultima_falha TIMESTAMP;
         """)
         cur.execute("""
+            ALTER TABLE processos
+            ADD COLUMN IF NOT EXISTS monitoramento_sem_correspondencia INTEGER DEFAULT 0;
+        """)
+        cur.execute("""
+            ALTER TABLE processos
+            ADD COLUMN IF NOT EXISTS monitoramento_ultima_sem_correspondencia TIMESTAMP;
+        """)
+        cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_processos_monitoramento_fila
             ON processos (data_atualizacao, id)
             WHERE em_monitoramento = TRUE;
@@ -443,10 +451,12 @@ def atualizar_status_monitoramento(processo_id, ativar=True):
                 data_atualizacao = CURRENT_TIMESTAMP,
                 monitoramento_falhas = 0,
                 monitoramento_ultimo_erro = NULL,
-                monitoramento_ultima_falha = NULL
+                monitoramento_ultima_falha = NULL,
+                monitoramento_sem_correspondencia = CASE WHEN %s THEN monitoramento_sem_correspondencia ELSE 0 END,
+                monitoramento_ultima_sem_correspondencia = CASE WHEN %s THEN monitoramento_ultima_sem_correspondencia ELSE NULL END
             WHERE id = %s
             """,
-            (ativar, processo_id),
+            (ativar, ativar, ativar, processo_id),
         )
         conn.commit()
         status_str = "ATIVADO" if ativar else "DESATIVADO"
@@ -476,7 +486,9 @@ def registrar_monitoramento_sucesso(processo_id):
             SET data_atualizacao = CURRENT_TIMESTAMP,
                 monitoramento_falhas = 0,
                 monitoramento_ultimo_erro = NULL,
-                monitoramento_ultima_falha = NULL
+                monitoramento_ultima_falha = NULL,
+                monitoramento_sem_correspondencia = 0,
+                monitoramento_ultima_sem_correspondencia = NULL
             WHERE id = %s
             """,
             (processo_id,),
@@ -520,6 +532,102 @@ def registrar_monitoramento_falha(processo_id, erro):
             )
     except Exception as e:
         logging.error(f"Erro ao registrar falha de monitoramento do processo {processo_id}: {e}")
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def registrar_monitoramento_sem_correspondencia(processo_id, quantidade):
+    conn = get_connection()
+    if not conn:
+        return 0
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE processos
+            SET monitoramento_sem_correspondencia = COALESCE(monitoramento_sem_correspondencia, 0) + 1,
+                monitoramento_ultima_sem_correspondencia = CURRENT_TIMESTAMP
+            WHERE id = %s
+            RETURNING monitoramento_sem_correspondencia
+            """,
+            (processo_id,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        contador = row[0] if row else 0
+        logging.warning(
+            "⚠️ Processo ID %s acumula %s rodada(s) com %s subsídio(s) sem correspondência exata.",
+            processo_id,
+            contador,
+            quantidade,
+        )
+        return contador
+    except Exception as e:
+        logging.error(
+            f"Erro ao registrar ausência de correspondência do processo {processo_id}: {e}"
+        )
+        return 0
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def limpar_monitoramento_sem_correspondencia(processo_id):
+    conn = get_connection()
+    if not conn:
+        return
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE processos
+            SET monitoramento_sem_correspondencia = 0,
+                monitoramento_ultima_sem_correspondencia = NULL
+            WHERE id = %s
+            """,
+            (processo_id,),
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(
+            f"Erro ao limpar ausência de correspondência do processo {processo_id}: {e}"
+        )
+    finally:
+        if cur:
+            cur.close()
+        conn.close()
+
+
+def obter_monitoramento_sem_correspondencia(processo_id):
+    conn = get_connection()
+    if not conn:
+        return 0
+
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(monitoramento_sem_correspondencia, 0)
+            FROM processos
+            WHERE id = %s
+            """,
+            (processo_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
+    except Exception as e:
+        logging.error(
+            f"Erro ao consultar ausência de correspondência do processo {processo_id}: {e}"
+        )
+        return 0
     finally:
         if cur:
             cur.close()

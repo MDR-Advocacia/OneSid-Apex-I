@@ -315,12 +315,12 @@ class ProcessoService:
         except TimeoutException as exc:
             current_url = self.portal_client.safe_current_url()
             if f"/editar/{npj_limpo}" in current_url:
-                logging.warning(
-                    "⚠️ Cabeçalho não confirmou o NPJ %s, mas a URL detalhada está correta. Seguindo para coleta.",
-                    npj_exibicao,
-                )
                 self.driver.switch_to.default_content()
-                return
+                raise PortalElementNotFoundError(
+                    f"Cabeçalho do processo não confirmou o NPJ {npj_exibicao}",
+                    current_url=current_url,
+                    expected=f"NPJ {npj_exibicao} visível no corpo da página antes da coleta",
+                ) from exc
 
             raise PortalElementNotFoundError(
                 f"Cabeçalho do processo não exibiu o NPJ {npj_exibicao}",

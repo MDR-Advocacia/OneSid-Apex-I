@@ -17,6 +17,8 @@ from .rpa_runner import PortalRPARunner
 
 
 class MonitorRPARunner(PortalRPARunner):
+    ESTADOS_RETORNO_FINAL = {"CONCLUIDO", "CONCLUÍDO", "EXCLUIDO", "EXCLUÍDO"}
+
     def __init__(self, browser_factory=None, *, max_process_attempts=3, notifier=None):
         super().__init__(browser_factory=browser_factory, max_task_attempts=max_process_attempts)
         self.notifier = notifier
@@ -36,6 +38,13 @@ class MonitorRPARunner(PortalRPARunner):
         )
         self.monitor_table_timeout = int(os.getenv("RPA_MONITOR_TABLE_TIMEOUT", "25"))
         self.monitor_batch_limit = int(os.getenv("RPA_MONITOR_BATCH_LIMIT", "50"))
+        self.clean_retry_missing_match_enabled = self._env_flag(
+            "RPA_MONITOR_CLEAN_RETRY_MISSING_MATCH_ENABLED",
+            True,
+        )
+        self.clean_retry_missing_match_threshold = int(
+            os.getenv("RPA_MONITOR_CLEAN_RETRY_MISSING_MATCH_THRESHOLD", "2")
+        )
 
     def run_cycle(self):
         logging.info("🔍 Buscando processos marcados para monitoramento.")
@@ -257,20 +266,73 @@ class MonitorRPARunner(PortalRPARunner):
             database.registrar_monitoramento_falha(processo_id, erro)
             return []
 
-        notificacoes = self._montar_notificacoes(
-            cnj,
+        sem_correspondencia_exata = self._solicitados_sem_correspondencia(
             subsidios_antigos,
             dados_novos,
         )
+
+        if self._deve_recoletar_com_sessao_limpa(
+            processo_id,
+            sem_correspondencia_exata,
+        ):
+            dados_novos, status_coleta, processo_id = self._recoletar_com_sessao_limpa(
+                processo,
+                processo_id,
+            )
+            if status_coleta == "indisponivel":
+                erro = "Tabela de subsídios indisponível após recoleta com sessão limpa"
+                logging.warning("⚠️ %s para %s.", erro, cnj)
+                database.registrar_monitoramento_falha(processo_id, erro)
+                return []
+
+            if status_coleta == "vazio" and self._tem_solicitado_sem_retorno(
+                subsidios_antigos,
+                dados_novos,
+            ):
+                logging.warning(
+                    "⚠️ Processo %s retornou lista vazia mesmo após sessão limpa. "
+                    "Mantendo monitoramento.",
+                    cnj,
+                )
+                database.registrar_monitoramento_falha(
+                    processo_id,
+                    "Lista vazia com subsídio SOLICITADO anterior após sessão limpa",
+                )
+                return []
+
+            if not dados_novos:
+                erro = "Tabela de subsídios sem linhas legíveis após sessão limpa"
+                logging.warning("⚠️ %s para %s.", erro, cnj)
+                database.registrar_monitoramento_falha(processo_id, erro)
+                return []
+
+            sem_correspondencia_exata = self._solicitados_sem_correspondencia(
+                subsidios_antigos,
+                dados_novos,
+            )
+
+        notificacoes = self._montar_notificacoes(cnj, subsidios_antigos, dados_novos)
         solicitados_sem_retorno = self._solicitados_sem_retorno(
+            subsidios_antigos,
+            dados_novos,
+        )
+        dados_para_salvar = self._preservar_solicitados_com_estado_intermediario(
             subsidios_antigos,
             dados_novos,
         )
         database.salvar_lista_subsidios(
             processo_id,
-            dados_novos,
+            dados_para_salvar,
             preservar_solicitados_sem_correspondencia=True,
         )
+
+        if sem_correspondencia_exata:
+            database.registrar_monitoramento_sem_correspondencia(
+                processo_id,
+                len(sem_correspondencia_exata),
+            )
+        else:
+            database.limpar_monitoramento_sem_correspondencia(processo_id)
 
         tem_pendencia = any(
             item["estado"].upper() == "SOLICITADO"
@@ -289,6 +351,95 @@ class MonitorRPARunner(PortalRPARunner):
             database.atualizar_status_monitoramento(processo_id, False)
 
         return notificacoes
+
+    @classmethod
+    def _preservar_solicitados_com_estado_intermediario(cls, subsidios_antigos, dados_novos):
+        correspondencias_usadas = set()
+        indices_intermediarios = set()
+
+        for antigo in subsidios_antigos:
+            if cls._normalizar_status(antigo.get("estado")) != "SOLICITADO":
+                continue
+
+            indice_correspondente, correspondente_novo = cls._buscar_correspondente_novo(
+                antigo,
+                dados_novos,
+                correspondencias_usadas,
+            )
+            if correspondente_novo is None:
+                continue
+
+            correspondencias_usadas.add(indice_correspondente)
+            estado_novo = cls._normalizar_status(correspondente_novo.get("estado"))
+            if estado_novo == "SOLICITADO" or cls._estado_retorno_final(estado_novo):
+                continue
+
+            indices_intermediarios.add(indice_correspondente)
+
+        if not indices_intermediarios:
+            return dados_novos
+
+        dados_ajustados = []
+        for indice, item in enumerate(dados_novos):
+            if indice not in indices_intermediarios:
+                dados_ajustados.append(item)
+                continue
+
+            item_ajustado = dict(item)
+            logging.info(
+                "⏸️ Subsídio em estado intermediário '%s' preservado como SOLICITADO até retorno final: %s | %s | %s",
+                item.get("estado") or "",
+                item.get("tipo") or "",
+                item.get("item") or "",
+                item.get("data_limite") or "",
+            )
+            item_ajustado["estado"] = "Solicitado"
+            dados_ajustados.append(item_ajustado)
+
+        return dados_ajustados
+
+    def _deve_recoletar_com_sessao_limpa(self, processo_id, sem_correspondencia_exata):
+        if not self.clean_retry_missing_match_enabled or not sem_correspondencia_exata:
+            return False
+
+        contador_atual = database.obter_monitoramento_sem_correspondencia(processo_id)
+        proxima_rodada = contador_atual + 1
+        if self.clean_retry_missing_match_threshold <= 1:
+            return True
+
+        return proxima_rodada % self.clean_retry_missing_match_threshold == 0
+
+    def _recoletar_com_sessao_limpa(self, processo, processo_id):
+        cnj = processo["cnj"]
+        logging.warning(
+            "🔁 Processo %s repetiu ausência de correspondência exata. "
+            "Reiniciando browser e refazendo coleta antes de segurar a devolutiva.",
+            cnj,
+        )
+
+        self.restart_browser("recoleta por ausência repetida de correspondência exata")
+        self.auth_service.ensure_authenticated()
+        npj_confirmado = self._reabrir_processo_monitorado(processo)
+
+        if npj_confirmado and npj_confirmado != processo.get("npj"):
+            processo_id = database.salvar_processo(cnj, npj_confirmado) or processo_id
+            processo["npj"] = npj_confirmado
+            logging.info(
+                "🧭 NPJ do monitor atualizado para %s no processo %s após sessão limpa.",
+                npj_confirmado,
+                cnj,
+            )
+
+        dados_novos, status_coleta = self._coletar_subsidios_monitorados()
+        if status_coleta == "indisponivel":
+            dados_novos, status_coleta, processo_id = self._tentar_coleta_por_npj_base(
+                processo,
+                processo_id,
+                processo.get("npj"),
+                origem="sessão limpa",
+            )
+
+        return dados_novos, status_coleta, processo_id
 
     def _coletar_subsidios_monitorados(self):
         return self.processo_service.coletar_lista_subsidios(
@@ -622,7 +773,7 @@ class MonitorRPARunner(PortalRPARunner):
             if correspondente_novo is not None:
                 correspondencias_usadas.add(indice_correspondente)
                 estado_novo = cls._normalizar_status(correspondente_novo.get("estado"))
-                if estado_novo != "SOLICITADO":
+                if cls._estado_retorno_final(estado_novo):
                     cls._adicionar_item_alterado(
                         itens_alterados,
                         chaves_itens_alterados,
@@ -697,12 +848,34 @@ class MonitorRPARunner(PortalRPARunner):
             )
             if correspondente_novo is not None:
                 correspondencias_usadas.add(indice_correspondente)
-                if cls._normalizar_status(correspondente_novo.get("estado")) != "SOLICITADO":
+                if cls._estado_retorno_final(correspondente_novo.get("estado")):
                     continue
 
             solicitados.append(antigo)
 
         return solicitados
+
+    @classmethod
+    def _solicitados_sem_correspondencia(cls, subsidios_antigos, dados_novos):
+        sem_correspondencia = []
+        correspondencias_usadas = set()
+
+        for antigo in subsidios_antigos:
+            if cls._normalizar_status(antigo.get("estado")) != "SOLICITADO":
+                continue
+
+            indice_correspondente, correspondente_novo = cls._buscar_correspondente_novo(
+                antigo,
+                dados_novos,
+                correspondencias_usadas,
+            )
+            if correspondente_novo is not None:
+                correspondencias_usadas.add(indice_correspondente)
+                continue
+
+            sem_correspondencia.append(antigo)
+
+        return sem_correspondencia
 
     @classmethod
     def _buscar_correspondente_novo(cls, antigo, dados_novos, indices_usados=None):
@@ -791,6 +964,10 @@ class MonitorRPARunner(PortalRPARunner):
     @staticmethod
     def _normalizar_status(status):
         return MonitorRPARunner._normalizar_texto(status)
+
+    @classmethod
+    def _estado_retorno_final(cls, status):
+        return cls._normalizar_status(status) in cls.ESTADOS_RETORNO_FINAL
 
     @staticmethod
     def _normalizar_texto(valor):
