@@ -1,0 +1,105 @@
+services:
+  db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASS:-postgres}
+      POSTGRES_DB: ${DB_NAME:-onesid_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-onesid_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  loki:
+    image: grafana/loki:2.9.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/config.yml"]
+    volumes:
+      - ./monitoring/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+
+  processador:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DB_HOST: db
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+      LOKI_APPLICATION: onesid-apex
+      RPA_CHROME_NO_SANDBOX: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      loki:
+        condition: service_started
+    shm_size: "2gb"
+    command:
+      [
+        "sh",
+        "-lc",
+        "xvfb-run -a -s '-screen 0 1920x1080x24' python main.py",
+      ]
+    volumes:
+      - app_logs:/app/logs
+
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DB_HOST: db
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+      LOKI_APPLICATION: onesid-apex
+      RPA_CHROME_NO_SANDBOX: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      loki:
+        condition: service_started
+    shm_size: "2gb"
+    command:
+      [
+        "sh",
+        "-lc",
+        "xvfb-run -a -s '-screen 0 1920x1080x24' python monitor_rpa.py",
+      ]
+    volumes:
+      - app_logs:/app/logs
+
+  coletor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      DB_HOST: db
+      LOKI_URL: http://loki:3100/loki/api/v1/push
+      LOKI_APPLICATION: onesid-apex
+    depends_on:
+      db:
+        condition: service_healthy
+      loki:
+        condition: service_started
+    command: ["python", "coletor_legalone.py"]
+    volumes:
+      - app_logs:/app/logs
+
+volumes:
+  postgres_data:
+  loki_data:
+  app_logs:
