@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
@@ -9,6 +10,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from .exceptions import LoginError, PortalTimeoutError
+from . import onelog_client
 
 
 class AuthService:
@@ -45,12 +47,44 @@ class AuthService:
         if not self._credentials_configured():
             raise LoginError("Credenciais BB_USUARIO/BB_SENHA não configuradas")
 
+        if onelog_client.is_configured():
+            if not force_login and self.is_session_active(probe=True):
+                onelog_client.renew_session()
+                logging.info("✅ Sessão ativa reaproveitada.")
+                return True
+            logging.info("🔐 Autenticação via OneLog necessária.")
+            return self.login_with_onelog()
+
         if not force_login and self.is_session_active(probe=True):
             logging.info("✅ Sessão ativa reaproveitada.")
             return True
 
         logging.info("🔐 Autenticação necessária. Iniciando login no portal.")
         return self.login()
+
+    def login_with_onelog(self):
+        with self._login_lock():
+            try:
+                session_data = onelog_client.get_session()
+                cookies = session_data.get("cookies") or []
+                user_agent = session_data.get("user_agent")
+
+                if user_agent:
+                    self._set_user_agent(user_agent)
+
+                self._inject_cookies(cookies)
+                self.driver.get(self.PORTAL_HOME_URL)
+                self.wait_for_document_ready(timeout=self.login_timeout)
+                self._wait_until_authenticated(timeout=self.login_timeout)
+                onelog_client.renew_session()
+                logging.info("✅ Login via OneLog confirmado em %s", self.safe_current_url())
+                return True
+            except Exception as exc:
+                raise LoginError(
+                    f"Falha ao autenticar via OneLog: {exc}",
+                    current_url=self.safe_current_url(),
+                    expected="sessão autenticada por cookies do OneLog",
+                ) from exc
 
     def login(self):
         usuario = os.getenv("BB_USUARIO")
@@ -333,6 +367,82 @@ class AuthService:
             )
         return result
 
+    def _set_user_agent(self, user_agent):
+        try:
+            self.driver.execute_cdp_cmd(
+                "Network.setUserAgentOverride",
+                {"userAgent": user_agent},
+            )
+        except WebDriverException as exc:
+            logging.warning("⚠️ Não foi possível aplicar user-agent do OneLog: %s", exc)
+
+    def _inject_cookies(self, cookies):
+        if not cookies:
+            raise LoginError(
+                "OneLog não retornou cookies",
+                current_url=self.safe_current_url(),
+                expected="lista de cookies autenticados",
+            )
+
+        cdp_cookies = []
+        for cookie in cookies:
+            formatted = self._format_cookie_for_cdp(cookie)
+            if formatted:
+                cdp_cookies.append(formatted)
+
+        if not cdp_cookies:
+            raise LoginError(
+                "Nenhum cookie do OneLog pôde ser formatado",
+                current_url=self.safe_current_url(),
+                expected="cookies compatíveis com CDP",
+            )
+
+        self.driver.execute_cdp_cmd("Network.enable", {})
+        self.driver.execute_cdp_cmd("Network.setCookies", {"cookies": cdp_cookies})
+        logging.info("🍪 %s cookies injetados a partir do OneLog.", len(cdp_cookies))
+
+    @staticmethod
+    def _format_cookie_for_cdp(cookie):
+        name = cookie.get("name")
+        value = cookie.get("value")
+        domain = cookie.get("domain")
+        if not name or value is None or not domain:
+            return None
+
+        formatted = {
+            "name": name,
+            "value": str(value),
+            "domain": domain,
+            "path": cookie.get("path") or "/",
+            "secure": bool(cookie.get("secure", True)),
+            "httpOnly": bool(cookie.get("httpOnly", cookie.get("http_only", False))),
+        }
+
+        expires = cookie.get("expires") or cookie.get("expiry") or cookie.get("expirationDate")
+        if expires:
+            try:
+                formatted["expires"] = float(expires)
+            except (TypeError, ValueError):
+                pass
+
+        same_site = cookie.get("sameSite") or cookie.get("same_site")
+        if same_site:
+            normalized = str(same_site).strip().capitalize()
+            if normalized in {"Strict", "Lax", "None"}:
+                formatted["sameSite"] = normalized
+
+        if "url" not in formatted:
+            host = domain.lstrip(".")
+            scheme = "https" if formatted["secure"] else "http"
+            formatted["url"] = f"{scheme}://{host}{formatted['path']}"
+            try:
+                parsed = urlparse(formatted["url"])
+                formatted["url"] = f"{parsed.scheme}://{parsed.netloc}{parsed.path or '/'}"
+            except Exception:
+                pass
+
+        return formatted
+
     @contextmanager
     def _login_lock(self):
         if not self.login_lock_enabled:
@@ -370,6 +480,8 @@ class AuthService:
 
     @staticmethod
     def _credentials_configured():
+        if onelog_client.is_configured():
+            return True
         return bool(os.getenv("BB_USUARIO")) and bool(os.getenv("BB_SENHA"))
 
     @staticmethod
