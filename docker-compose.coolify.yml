@@ -21,24 +21,6 @@ services:
     volumes:
       - loki_data:/loki
 
-  grafana:
-    image: grafana/grafana:11.0.0
-    restart: unless-stopped
-    depends_on:
-      - loki
-    environment:
-      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
-      GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_AUTH_ANONYMOUS_ENABLED: "false"
-    expose:
-      - "3000"
-    volumes:
-      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
-      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
-      - grafana_data:/var/lib/grafana
-
   processador:
     build:
       context: .
@@ -119,5 +101,4 @@ services:
 volumes:
   postgres_data:
   loki_data:
-  grafana_data:
   app_logs:
