@@ -21,6 +21,16 @@ class LoginError(RPAError):
     pass
 
 
+class OneLogUnavailableError(LoginError):
+    """OneLog fora do ar ou em janela de backoff.
+
+    Não deve provocar restart de browser nem novas tentativas imediatas:
+    o runner interrompe o ciclo e deixa as tarefas para o próximo agendamento.
+    """
+
+    pass
+
+
 class SessionExpiredError(RPAError):
     pass
 

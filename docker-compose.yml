@@ -61,6 +61,13 @@ services:
       dockerfile: Dockerfile
     container_name: onesid-processador
     restart: unless-stopped
+    # init: PID 1 com reaper de zumbis (xvfb-run/sh não recolhe órfãos do Chrome)
+    init: true
+    # Limites duros: um vazamento de Chromes é contido pelo cgroup antes de
+    # derrubar o host (incidente de 13/08/2026: 3,5 GiB e ~2.000 PIDs)
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 768
     env_file:
       - .env
     environment:
@@ -94,6 +101,10 @@ services:
       dockerfile: Dockerfile
     container_name: onesid-monitor
     restart: unless-stopped
+    init: true
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 768
     env_file:
       - .env
     environment:
@@ -127,6 +138,7 @@ services:
       dockerfile: Dockerfile
     container_name: onesid-coletor
     restart: unless-stopped
+    init: true
     env_file:
       - .env
     environment:

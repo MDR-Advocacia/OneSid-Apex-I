@@ -7,6 +7,7 @@ from bd import database
 
 from .exceptions import (
     LoginError,
+    OneLogUnavailableError,
     PortalElementNotFoundError,
     PortalNavigationError,
     PortalTimeoutError,
@@ -75,12 +76,23 @@ class MonitorRPARunner(PortalRPARunner):
         else:
             logging.info("📋 Encontrados %s processos para verificar.", len(processos_monitorados))
 
+        onelog_indisponivel = False
         for processo in processos_monitorados:
-            notificacoes = self._processar_processo(processo)
+            try:
+                notificacoes = self._processar_processo(processo)
+            except OneLogUnavailableError as exc:
+                logging.warning(
+                    "⛔ OneLog indisponível/em backoff. Interrompendo o ciclo do "
+                    "monitor; processos restantes ficam para o próximo: %s",
+                    exc,
+                )
+                onelog_indisponivel = True
+                break
             if notificacoes and self.notifier:
                 self._enviar_notificacoes(notificacoes)
 
-        self._reconciliar_falsos_negativos(candidatos_reconciliacao)
+        if not onelog_indisponivel:
+            self._reconciliar_falsos_negativos(candidatos_reconciliacao)
 
         if self.notifier:
             self._reenviar_notificacoes_pendentes()
@@ -94,6 +106,8 @@ class MonitorRPARunner(PortalRPARunner):
 
         try:
             return self._processar_processo_com_retry(processo)
+        except OneLogUnavailableError:
+            raise
         except Exception as exc:
             logging.error("❌ Falha definitiva ao monitorar %s: %s", cnj, exc)
             return []
@@ -107,6 +121,10 @@ class MonitorRPARunner(PortalRPARunner):
                 self.ensure_browser()
                 self.auth_service.ensure_authenticated()
                 return self._processar_processo_uma_vez(processo)
+            except OneLogUnavailableError as exc:
+                last_error = exc
+                logging.warning("⛔ OneLog indisponível no monitor para %s: %s", cnj, exc)
+                break
             except SessionExpiredError as exc:
                 last_error = exc
                 logging.warning(
@@ -117,6 +135,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.auth_service.ensure_authenticated(force_login=True)
                     continue
             except LoginError as exc:
@@ -129,6 +148,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("falha de login no monitor")
                     continue
             except (PortalTimeoutError, TemporaryPortalError, PortalNavigationError) as exc:
@@ -141,6 +161,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self._recuperar_navegacao_monitorada(processo)
                     continue
             except PortalElementNotFoundError as exc:
@@ -153,6 +174,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self._reabrir_processo_monitorado(processo, preferir_fallback=True)
                     continue
             except WebDriverException as exc:
@@ -165,6 +187,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("erro de webdriver no monitor")
                     continue
             except Exception as exc:
@@ -176,6 +199,7 @@ class MonitorRPARunner(PortalRPARunner):
                     self.max_task_attempts,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("erro inesperado no monitor")
                     continue
             break
@@ -534,7 +558,14 @@ class MonitorRPARunner(PortalRPARunner):
         )
 
         for processo in candidatos:
-            self._reconciliar_processo(processo)
+            try:
+                self._reconciliar_processo(processo)
+            except OneLogUnavailableError as exc:
+                logging.warning(
+                    "⛔ OneLog indisponível/em backoff. Interrompendo reconciliação: %s",
+                    exc,
+                )
+                break
 
     def _buscar_candidatos_reconciliacao(self, *, exclude_process_ids):
         if not self.reconcile_enabled:
@@ -555,6 +586,8 @@ class MonitorRPARunner(PortalRPARunner):
 
         try:
             self._reconciliar_processo_com_retry(processo)
+        except OneLogUnavailableError:
+            raise
         except Exception as exc:
             logging.warning("⚠️ Não foi possível reconciliar %s nesta rodada: %s", cnj, exc)
 
@@ -568,6 +601,10 @@ class MonitorRPARunner(PortalRPARunner):
                 self.auth_service.ensure_authenticated()
                 self._reconciliar_processo_uma_vez(processo)
                 return
+            except OneLogUnavailableError as exc:
+                last_error = exc
+                logging.warning("⛔ OneLog indisponível na reconciliação de %s: %s", cnj, exc)
+                break
             except SessionExpiredError as exc:
                 last_error = exc
                 logging.warning(
@@ -578,6 +615,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.auth_service.ensure_authenticated(force_login=True)
                     continue
             except LoginError as exc:
@@ -590,6 +628,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("falha de login na reconciliação")
                     continue
             except (PortalTimeoutError, TemporaryPortalError, PortalNavigationError) as exc:
@@ -602,6 +641,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self._recuperar_navegacao_monitorada(processo)
                     continue
             except PortalElementNotFoundError as exc:
@@ -614,6 +654,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self._reabrir_processo_monitorado(processo, preferir_fallback=True)
                     continue
             except WebDriverException as exc:
@@ -626,6 +667,7 @@ class MonitorRPARunner(PortalRPARunner):
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("erro de webdriver na reconciliação")
                     continue
             except Exception as exc:
@@ -637,6 +679,7 @@ class MonitorRPARunner(PortalRPARunner):
                     self.max_task_attempts,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("erro inesperado na reconciliação")
                     continue
             break

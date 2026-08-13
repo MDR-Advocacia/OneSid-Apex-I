@@ -9,7 +9,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from .exceptions import LoginError, PortalTimeoutError
+from .exceptions import LoginError, OneLogUnavailableError, PortalTimeoutError
 from . import onelog_client
 
 
@@ -79,6 +79,10 @@ class AuthService:
                 onelog_client.renew_session()
                 logging.info("✅ Login via OneLog confirmado em %s", self.safe_current_url())
                 return True
+            except OneLogUnavailableError:
+                # OneLog fora/backoff: propaga sem mascarar como LoginError
+                # genérico, para o runner NÃO reiniciar o browser em cascata.
+                raise
             except Exception as exc:
                 raise LoginError(
                     f"Falha ao autenticar via OneLog: {exc}",

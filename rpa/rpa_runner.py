@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 
 from selenium.common.exceptions import WebDriverException
 
@@ -8,6 +10,7 @@ from .auth_service import AuthService
 from .browser_factory import BrowserFactory
 from .exceptions import (
     LoginError,
+    OneLogUnavailableError,
     PortalElementNotFoundError,
     PortalNavigationError,
     PortalTimeoutError,
@@ -45,7 +48,15 @@ class PortalRPARunner:
             return
 
         for tarefa in fila_pendente:
-            self._processar_tarefa(tarefa)
+            try:
+                self._processar_tarefa(tarefa)
+            except OneLogUnavailableError as exc:
+                logging.warning(
+                    "⛔ OneLog indisponível/em backoff. Interrompendo o ciclo; "
+                    "tarefas restantes ficam para o próximo agendamento: %s",
+                    exc,
+                )
+                break
 
         logging.info("💤 Ciclo de processamento finalizado.")
 
@@ -91,6 +102,10 @@ class PortalRPARunner:
         try:
             self._processar_tarefa_com_retry(tarefa)
             database.marcar_tarefa_concluida(tarefa_id, "CONCLUIDO")
+        except OneLogUnavailableError:
+            # Não marca ERRO: a tarefa permanece pendente para o próximo
+            # ciclo, quando o OneLog deve ter se recuperado.
+            raise
         except Exception as exc:
             logging.error("❌ Falha definitiva no CNJ %s: %s", cnj, exc)
             database.marcar_tarefa_concluida(tarefa_id, "ERRO", str(exc))
@@ -105,6 +120,16 @@ class PortalRPARunner:
                 self.auth_service.ensure_authenticated()
                 self._processar_tarefa_uma_vez(tarefa)
                 return
+            except OneLogUnavailableError as exc:
+                # OneLog fora/backoff: não adianta repetir agora nem reiniciar
+                # o browser — cada restart custaria um Chrome novo à toa.
+                last_error = exc
+                logging.warning(
+                    "⛔ OneLog indisponível para o CNJ %s: %s",
+                    cnj,
+                    exc,
+                )
+                break
             except SessionExpiredError as exc:
                 last_error = exc
                 logging.warning(
@@ -115,6 +140,7 @@ class PortalRPARunner:
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.auth_service.ensure_authenticated(force_login=True)
                     continue
             except LoginError as exc:
@@ -127,6 +153,7 @@ class PortalRPARunner:
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("falha de login")
                     continue
             except (PortalTimeoutError, TemporaryPortalError, PortalNavigationError) as exc:
@@ -139,6 +166,7 @@ class PortalRPARunner:
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self._recuperar_navegacao(cnj)
                     continue
             except PortalElementNotFoundError as exc:
@@ -151,6 +179,7 @@ class PortalRPARunner:
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self._reabrir_processo(cnj)
                     continue
             except WebDriverException as exc:
@@ -163,6 +192,7 @@ class PortalRPARunner:
                     exc,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("erro de webdriver")
                     continue
             except Exception as exc:
@@ -174,6 +204,7 @@ class PortalRPARunner:
                     self.max_task_attempts,
                 )
                 if tentativa < self.max_task_attempts:
+                    self._aguardar_nova_tentativa(tentativa)
                     self.restart_browser("erro inesperado")
                     continue
             break
@@ -223,6 +254,18 @@ class PortalRPARunner:
     def _reabrir_processo(self, cnj):
         logging.info("↩️ Reabrindo consulta rápida do CNJ %s.", cnj)
         self.processo_service.acessar_processo_consulta_rapida(cnj)
+
+    def _aguardar_nova_tentativa(self, tentativa):
+        """Backoff exponencial entre tentativas (5s, 10s, 20s... teto 60s).
+
+        Sem essa pausa, uma falha sistêmica (portal fora, OneLog fora) vira
+        um loop apertado de restart de browser, multiplicando Chromes.
+        """
+        base = int(os.getenv("RPA_RETRY_BACKOFF_BASE_SECONDS", "5"))
+        teto = int(os.getenv("RPA_RETRY_BACKOFF_MAX_SECONDS", "60"))
+        delay = min(teto, base * (2 ** (tentativa - 1)))
+        logging.info("⏲️ Aguardando %ss antes da próxima tentativa.", delay)
+        time.sleep(delay)
 
     def _reset_state(self):
         self.driver = None

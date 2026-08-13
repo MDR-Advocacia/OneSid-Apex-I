@@ -43,7 +43,9 @@ class BrowserFactory:
         if self.headless:
             options.add_argument("--headless=new")
             options.add_argument("--window-size=1920,1080")
-            options.add_argument("--remote-debugging-port=9222")
+            # Porta de debug fica dinâmica (o undetected_chromedriver escolhe
+            # uma porta livre). Porta fixa 9222 fazia um Chrome vazado impedir
+            # toda inicialização seguinte, realimentando o ciclo de falhas.
         else:
             options.add_argument("--start-maximized")
         if self.no_sandbox:
@@ -67,6 +69,7 @@ class BrowserFactory:
                 "⚠️ Cache do undetected_chromedriver ficou inconsistente. Limpando %s e tentando novamente.",
                 self.cache_dir,
             )
+            self._kill_chrome_tree(profile_path)
             self._clear_uc_cache()
             try:
                 return self._start_chrome(
@@ -76,11 +79,16 @@ class BrowserFactory:
                 )
             except Exception as retry_exc:
                 logging.exception("Falha ao inicializar o navegador após limpar o cache do driver.")
+                self._kill_chrome_tree(profile_path)
                 self._cleanup_profile_dir(profile_path, persistent_profile)
                 raise BrowserInitializationError(
                     "Falha ao inicializar o navegador"
                 ) from retry_exc
         except Exception as exc:
+            # Se o uc.Chrome falhou DEPOIS de spawnar o processo (ex.: timeout
+            # ao conectar na porta de debug), o Chrome fica órfão. Mata a
+            # árvore associada ao perfil antes de qualquer nova tentativa.
+            self._kill_chrome_tree(profile_path)
             if persistent_profile:
                 logging.warning(
                     "⚠️ Falha ao abrir o Chrome com o perfil persistente em %s. Tentando perfil temporário.",
@@ -98,6 +106,7 @@ class BrowserFactory:
                     logging.exception(
                         "Falha ao inicializar o navegador após fallback para perfil temporário."
                     )
+                    self._kill_chrome_tree(temp_profile_path)
                     self._cleanup_profile_dir(temp_profile_path, False)
                     raise BrowserInitializationError(
                         "Falha ao inicializar o navegador"
@@ -121,7 +130,16 @@ class BrowserFactory:
 
         try:
             driver.quit()
+        except Exception:
+            logging.exception(
+                "driver.quit() falhou. Forçando encerramento da árvore do Chrome."
+            )
         finally:
+            # Garantia dura: mesmo que o quit() tenha falhado ou deixado
+            # processos para trás, a árvore do Chrome deste perfil morre aqui,
+            # ANTES de neutralizarmos o finalizador do driver.
+            self._kill_driver_service(driver)
+            self._kill_chrome_tree(profile_path)
             self._neutralize_driver_finalizer(driver)
             if profile_path:
                 self._cleanup_profile_dir(Path(profile_path), persistent_profile)
@@ -248,6 +266,57 @@ class BrowserFactory:
     def _clear_uc_cache(self):
         if self.cache_dir.exists():
             shutil.rmtree(self.cache_dir, ignore_errors=True)
+
+    @staticmethod
+    def _kill_chrome_tree(profile_path):
+        """Mata qualquer processo Chrome associado ao perfil informado.
+
+        Cada driver usa um --user-data-dir exclusivo, então o padrão só
+        alcança a árvore do browser deste driver. SIGTERM primeiro; se algo
+        sobreviver, SIGKILL. Sem isso, um quit() falho ou um uc.Chrome que
+        morreu no meio da inicialização deixa Chromes órfãos acumulando até
+        esgotar RAM/PIDs do container.
+        """
+        if not profile_path:
+            return
+
+        pattern = f"--user-data-dir={profile_path}"
+        try:
+            subprocess.run(
+                ["pkill", "-TERM", "-f", pattern],
+                check=False,
+                capture_output=True,
+            )
+            time.sleep(2)
+            survivors = subprocess.run(
+                ["pgrep", "-f", pattern],
+                check=False,
+                capture_output=True,
+            )
+            if survivors.returncode == 0:
+                logging.warning(
+                    "🔪 Chrome do perfil %s sobreviveu ao SIGTERM. Aplicando SIGKILL.",
+                    profile_path,
+                )
+                subprocess.run(
+                    ["pkill", "-KILL", "-f", pattern],
+                    check=False,
+                    capture_output=True,
+                )
+        except Exception:
+            logging.exception(
+                "Falha ao encerrar árvore do Chrome do perfil %s.", profile_path
+            )
+
+    @staticmethod
+    def _kill_driver_service(driver):
+        """Encerra o processo do chromedriver deste driver, se ainda existir."""
+        try:
+            process = getattr(getattr(driver, "service", None), "process", None)
+            if process is not None and process.poll() is None:
+                process.kill()
+        except Exception:
+            pass
 
     @staticmethod
     def _neutralize_driver_finalizer(driver):

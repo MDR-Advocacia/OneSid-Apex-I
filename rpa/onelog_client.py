@@ -4,6 +4,8 @@ import time
 
 import requests
 
+from .exceptions import OneLogUnavailableError
+
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -15,12 +17,74 @@ HEARTBEAT_INTERVAL_SECONDS = 15 * 60
 _last_heartbeat = 0
 _current_sector = None
 
+# Circuit breaker: após falhas consecutivas do OneLog, bloqueia novas
+# tentativas por uma janela exponencial em vez de martelar a API (e de
+# provocar restarts de browser em cascata nos runners).
+_consecutive_failures = 0
+_blocked_until = 0.0
+
+
+def _backoff_base_seconds():
+    return int(os.getenv("ONELOG_BACKOFF_BASE_SECONDS", "30"))
+
+
+def _backoff_max_seconds():
+    return int(os.getenv("ONELOG_BACKOFF_MAX_SECONDS", "900"))
+
+
+def _register_failure():
+    global _consecutive_failures, _blocked_until
+    _consecutive_failures += 1
+    delay = min(
+        _backoff_max_seconds(),
+        _backoff_base_seconds() * (2 ** (_consecutive_failures - 1)),
+    )
+    _blocked_until = time.time() + delay
+    logging.warning(
+        "🚧 OneLog em backoff por %ss após %s falha(s) consecutiva(s).",
+        delay,
+        _consecutive_failures,
+    )
+
+
+def _register_success():
+    global _consecutive_failures, _blocked_until
+    _consecutive_failures = 0
+    _blocked_until = 0.0
+
+
+def _ensure_not_blocked():
+    remaining = _blocked_until - time.time()
+    if remaining > 0:
+        raise OneLogUnavailableError(
+            f"OneLog em backoff por falhas consecutivas; "
+            f"nova tentativa liberada em {int(remaining)}s"
+        )
+
 
 def is_configured():
     return bool(os.getenv("ONELOG_USERNAME")) and bool(os.getenv("ONELOG_PASSWORD"))
 
 
 def get_session():
+    _ensure_not_blocked()
+    try:
+        session_data = _get_session_inner()
+    except PermissionError:
+        # Credencial recusada: repetir não resolve, mas também não é
+        # indisponibilidade — deixa o erro claro para o operador.
+        raise
+    except OneLogUnavailableError:
+        raise
+    except (requests.RequestException, TimeoutError, RuntimeError) as exc:
+        _register_failure()
+        raise OneLogUnavailableError(f"OneLog indisponível: {exc}") from exc
+
+    _register_success()
+    return session_data
+
+
+def _get_session_inner():
     global _current_sector
 
     username = os.getenv("ONELOG_USERNAME")
