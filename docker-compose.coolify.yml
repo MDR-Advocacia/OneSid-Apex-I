@@ -33,6 +33,12 @@ services:
     mem_limit: 3g
     memswap_limit: 3g
     pids_limit: 768
+    # Selenium/Chrome consomem muitos file descriptors; o padrão de 1024
+    # (soft) esgota em dias de operação (incidente de 15/08/2026)
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     env_file:
       - .env
     environment:
@@ -65,6 +71,10 @@ services:
     mem_limit: 3g
     memswap_limit: 3g
     pids_limit: 768
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     env_file:
       - .env
     environment:

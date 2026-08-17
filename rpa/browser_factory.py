@@ -138,6 +138,7 @@ class BrowserFactory:
             # Garantia dura: mesmo que o quit() tenha falhado ou deixado
             # processos para trás, a árvore do Chrome deste perfil morre aqui,
             # ANTES de neutralizarmos o finalizador do driver.
+            self._close_command_executor(driver)
             self._kill_driver_service(driver)
             self._kill_chrome_tree(profile_path)
             self._neutralize_driver_finalizer(driver)
@@ -307,6 +308,33 @@ class BrowserFactory:
             logging.exception(
                 "Falha ao encerrar árvore do Chrome do perfil %s.", profile_path
             )
+
+    @staticmethod
+    def _close_command_executor(driver):
+        """Fecha o pool de conexões HTTP do Selenium com o chromedriver.
+
+        Matar os processos não fecha o lado local das conexões keep-alive:
+        elas ficam em CLOSE_WAIT e vazam file descriptors a cada ciclo, até
+        o processo esgotar o limite (incidente de 15/08/2026: monitor com
+        ~1.000 sockets vazados e 'Too many open files', sem conseguir abrir
+        navegador em nenhum ciclo).
+        """
+        executor = getattr(driver, "command_executor", None)
+        if executor is None:
+            return
+
+        close = getattr(executor, "close", None)
+        if callable(close):
+            try:
+                close()
+                return
+            except Exception:
+                pass
+
+        try:
+            executor._conn.clear()
+        except Exception:
+            pass
 
     @staticmethod
     def _kill_driver_service(driver):
